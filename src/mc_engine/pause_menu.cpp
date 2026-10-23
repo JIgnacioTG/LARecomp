@@ -29,6 +29,9 @@
 #include <rex/ppc/function.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/ui/windowed_app_context.h>
+#if defined(__linux__)
+#include <SDL3/SDL_events.h>
+#endif
 
 REXCVAR_DEFINE_BOOL(show_test_movie, false, "MCLA/Settings",
     "Show the TestMovie debug button in the pause menu")
@@ -1936,7 +1939,17 @@ bool Hook_PMLodTrafficClick(PPCRegister& r3, PPCRegister& r31) {
         auto* app_context = runtime ? runtime->app_context() : nullptr;
         if (app_context) {
             MC_INFO("[pause-menu] quit requested from Settings");
+#if defined(__linux__)
+            // Route through normal window closure so the title is stopped
+            // before the UI loop exits; deferred quit alone bypasses it.
+            SDL_Event event{};
+            event.type = SDL_EVENT_QUIT;
+            if (!SDL_PushEvent(&event)) {
+                MC_WARN("[pause-menu] could not queue quit: {}", SDL_GetError());
+            }
+#else
             app_context->RequestDeferredQuit();
+#endif
         } else {
             MC_WARN("[pause-menu] quit requested, but app context is unavailable");
         }
