@@ -48,6 +48,10 @@ Full write-up in [`TECHNICAL_NOTES.md`](documentation/TECHNICAL_NOTES.md).
 
 ---
 
+## Native Linux/Vulkan in this fork
+
+The `build/linux-vulkan` branch carries the optimized native Linux build and Linux quit fix. See [Linux build and upstream update instructions](documentation/LINUX_VULKAN.md). Windows-only experimental D3D12 rendering is excluded on Linux.
+
 ## Getting it running
 
 ### You need

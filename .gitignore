@@ -76,3 +76,5 @@ Thumbs.db
 # version. Nothing in the directory is tracked.
 src/assets/
 translations/
+# Runtime diagnostic output
+rubberband_dump.txt
