@@ -170,6 +170,12 @@ set(LARECOMP_SOURCES
     src/saveporter/larecomp_save_porter.cpp
     src/bootprogress/larecomp_boot_progress.cpp
 )
+# The experimental native renderer is D3D12-only; Linux retains the
+# supported Xenos GPU plugin with its Vulkan backend.
+if(NOT WIN32)
+    list(FILTER LARECOMP_SOURCES EXCLUDE REGEX "^src/native_gfx/")
+endif()
+
 if(REXGLUE_ENABLE_XEO3_TARGET)
     # The XEO3 DLL is a separate build, not a variant of this one: it needs the
     # XEO3 Clang fork (this project's compiler cannot produce the calling
@@ -213,6 +219,12 @@ else()
     # emulation is a runtime-loaded plugin now, so it is never linked and
     # TARGET_RUNTIME_DLLS does not see it.
     rexglue_setup_target(larecomp GPU_PLUGINS xenos)
+
+    if(UNIX AND NOT APPLE)
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(GTK3 REQUIRED IMPORTED_TARGET gtk+-3.0)
+        target_link_libraries(larecomp PRIVATE PkgConfig::GTK3)
+    endif()
 
     # rexglue 0.7.4
     if(WIN32)

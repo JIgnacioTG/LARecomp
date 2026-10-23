@@ -21,6 +21,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <chrono>
+#include <thread>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -2624,7 +2626,7 @@ bool ProbeAddress(uint32_t address) { return address >= 0x40000000u && address <
 void PartProbeLoop() {
     std::string last;
     for (;;) {
-        Sleep(1000);
+        std::this_thread::sleep_for(std::chrono::seconds(1));
         if (!REXCVAR_GET(model_mods_part_probe)) continue;
         auto* runtime = rex::Runtime::instance();
         if (!runtime || !runtime->memory()) continue;
@@ -2703,10 +2705,15 @@ void PartProbeLoop() {
 void StartPartProbe() {
     static std::once_flag once;
     std::call_once(once, [] {
+#if defined(_WIN32)
         HANDLE thread = CreateThread(
             nullptr, 0, [](LPVOID) -> DWORD { PartProbeLoop(); return 0; }, nullptr, 0, nullptr);
         LARECOMP_APP_INFO("[mods-probe] started ({})", thread ? "thread up" : "CreateThread failed");
         if (thread) CloseHandle(thread);
+#else
+        std::thread(PartProbeLoop).detach();
+        LARECOMP_APP_INFO("[mods-probe] started (thread up)");
+#endif
     });
 }
 

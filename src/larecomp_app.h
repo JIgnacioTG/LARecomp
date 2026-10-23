@@ -12,6 +12,7 @@
 #include "crash_handler.h"
 #include "achievement_metadata.h"
 #include "mc_engine/hooks/hooks.h"
+#if defined(_WIN32)
 #include "native_gfx/nocp/nocp_app.h"
 #include "native_gfx/native_gfx.h"
 #include "native_gfx/d3d12/device_manager.h"
@@ -20,6 +21,7 @@
 REXCVAR_DECLARE(bool, mcla_native_gfx);
 REXCVAR_DECLARE(bool, mcla_native_gfx_own_device);
 REXCVAR_DECLARE(bool, mcla_native_gfx_own_swapchain);
+#endif
 #include "mc_engine/guest_profiler.h"
 #include "mc_engine/pause_menu.h"
 #include "mc_engine/map_mouse.h"
@@ -296,9 +298,12 @@ class LarecompApp : public rex::ReXApp {
     // loaded -- not disabled, absent: no command processor, no PM4 parser, no
     // register file, no EDRAM, no shader translator. The kernel's Vd* exports
     // already have a designed path for that ("no GPU emulation loaded").
+#if defined(_WIN32)
     if (mcla::native_gfx::nocp::WantNoCommandProcessor()) {
       config.gpu_plugin.clear();
-    } else if (config.gpu_plugin.empty()) {
+    } else
+#endif
+    if (config.gpu_plugin.empty()) {
       // The Xenos GPU emulation is a runtime-loaded plugin as of SDK 0.9.0 and
       // the gpu_plugin cvar defaults to empty (= no GPU at all). Name it here
       // so the game works without anything in larecomp.toml; an explicit cvar
@@ -314,10 +319,12 @@ class LarecompApp : public rex::ReXApp {
   // SetupPresentation is forced by the order -- the base calls this from
   // inside SetupPresentation, before the override below gets to run.
   std::unique_ptr<rex::ui::ImmediateDrawer> OnCreateImmediateDrawer() override {
-    if (!mcla::native_gfx::nocp::WantNoCommandProcessor()) {
-      return nullptr;
+#if defined(_WIN32)
+    if (mcla::native_gfx::nocp::WantNoCommandProcessor()) {
+      return mcla::native_gfx::nocp::CreateImmediateDrawer();
     }
-    return mcla::native_gfx::nocp::CreateImmediateDrawer();
+#endif
+    return nullptr;
   }
 
   // The base opens the window and, with no graphics system, takes its detached
@@ -375,11 +382,13 @@ class LarecompApp : public rex::ReXApp {
     }
 #endif
 
-    if (!mcla::native_gfx::nocp::WantNoCommandProcessor()) {
-      return true;
+#if defined(_WIN32)
+    if (mcla::native_gfx::nocp::WantNoCommandProcessor()) {
+      return mcla::native_gfx::nocp::AttachPresentation(window(), imgui_drawer(),
+                                                       immediate_drawer());
     }
-    return mcla::native_gfx::nocp::AttachPresentation(window(), imgui_drawer(),
-                                                      immediate_drawer());
+#endif
+    return true;
   }
 
   void OnShutdown() override {
@@ -574,9 +583,11 @@ class LarecompApp : public rex::ReXApp {
     // SetupPresentation (rex_app.cpp:117) BEFORE ConstructRuntime (:159), and
     // the memory system and kernel state that an MMIO mapping needs are created
     // inside runtime_->Setup. This is the first point where both exist.
+#if defined(_WIN32)
     if (mcla::native_gfx::nocp::WantNoCommandProcessor()) {
       mcla::native_gfx::nocp::InstallGuestGpu();
     }
+#endif
 
     // Register t: drive - game uses it for city/art/collision data (.loc files etc.)
     if (auto* rt = rex::Runtime::instance()) {
@@ -689,9 +700,11 @@ class LarecompApp : public rex::ReXApp {
     // in the SDK counts guest frames, so the no-CP runtime supplies them from
     // its own swap hook. Through the public ReXApp hook, which both the stock
     // SDK and the fork have.
+#if defined(_WIN32)
     if (mcla::native_gfx::nocp::WantNoCommandProcessor()) {
       SetGuestFrameStats([] { return mcla::native_gfx::nocp::GuestFrameStats(); });
     }
+#endif
 
     // The rest of setup -- the mod/music build, then the hooks -- continues in
     // LaunchModule, so the build can run off the UI thread without a nested
