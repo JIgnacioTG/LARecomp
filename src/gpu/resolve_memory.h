@@ -1,0 +1,475 @@
+#pragma once
+// ===========================================================================
+// MCLA GPU renderer -- the resolve memory: what resolves write, as guest bytes
+// ===========================================================================
+// (M5.2b). On the console a resolve
+// writes guest memory, and any later fetch of those bytes -- with the
+// destination's own shape or another one -- reads what the resolve left. The
+// resolve bridge (resolve.h) keeps each destination as a host texture keyed by
+// the destination's fetch, which serves the fetches with that key; this keeps
+// the bytes themselves, on the GPU, for every other reader: a fetch with
+// another format, size, tiling or base over memory resolves wrote
+// (reinterpretation), decoded from here in its own layout.
+//
+// Storage. Guest physical memory in 64 KiB chunks; a chunk gets a place in a
+// pool buffer the first time a resolve or a read needs it, through a table of
+// kChunkCount entries the shaders read (hlsl/resolve_memory.hlsli). The pool
+// starts at kInitialPoolChunks and doubles when full (copied on the GPU, in
+// list order; the old buffer retired by the FrameRing). Chunks are never given
+// back: the RAGE render-target pools resolve into fixed ranges (425 chunks,
+// 26.6 MiB, in the measured frames).
+//
+// Pages (4 KiB, the CPU's bookkeeping):
+//  - valid: the pool holds the console's bytes for the whole page. Set when the
+//    page is uploaded from guest memory or a resolve covers all of it; cleared
+//    when the CPU writes it (the write watch, armed on valid pages).
+//  - newer: a resolve wrote bytes there that guest memory does not hold. A
+//    fetch over such a page (and no product of its image) reads from here.
+//  - a sequence number, bumped by every write into the page, so a decoded
+//    texture knows when it is stale.
+// A resolve that covers a page only in part needs the rest of it: the page is
+// uploaded from guest memory first unless it is already valid.
+//
+// Encode (hlsl/resolve_memory_cs.hlsl): a compute dispatch writes a resolve's
+// rectangle as bytes in the destination's layout and endian -- colour from
+// the product the conversion pass wrote, depth from the EDRAM target (stencil
+// included). Depth is encoded right after its resolve: the EDRAM target
+// changes with the next draw. Colour waits in a batch (each dispatch after its
+// conversion pass was a GPU bubble: 1.1 ms/frame for 56 resolves):
+// the product keeps its texels until a resolve writes it again, so the batch
+// is recorded at the end of the frame, or earlier when something must see the
+// bytes or the product changes -- before a decode, a lock, a depth encode, or
+// a resolve into the same level that overlaps a waiting rectangle without
+// covering it (one that covers it replaces it). Dispatches whose pages overlap
+// keep their order behind a barrier; the rest run back to back.
+//
+// Decode (hlsl/resolve_memory_ps.hlsl): a full-screen pass per level into a
+// host texture with the fetch's key, cached until a page of its range changes.
+// Formats: the uncompressed ones of format.h's table; block-compressed reads
+// are reported (kUnsupported) and left to the guest-memory path.
+//
+// Vertex copy (hlsl/resolve_memory_vertex_cs.hlsl): a vertex
+// stream over pages a resolve wrote is built from the pool on the GPU -- the
+// console's resolve-to-vertex-buffer -- swapped by the stream's plan into a
+// device buffer of the frame, which the draw binds.
+//
+// Threading: render thread only, after Initialize.
+// ===========================================================================
+
+#include <array>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include <plume_render_interface.h>
+
+#include "guest_memory.h"
+#include "region_index.h"
+#include "textures.h"
+
+namespace mcla::gpu {
+
+class BindlessHeap;
+class Device;
+class EdramTargets;
+class FrameRing;
+class HostPasses;
+class PassTiming;
+class UploadRing;
+
+class ResolveMemory {
+ public:
+  static constexpr uint32_t kChunkShift = 16;  // 64 KiB
+  static constexpr uint32_t kChunkBytes = 1u << kChunkShift;
+  static constexpr uint32_t kChunkCount = 8192;  // 512 MiB of physical memory
+  static constexpr uint32_t kPageShift = 12;
+  static constexpr uint32_t kPageBytes = 1u << kPageShift;
+  static constexpr uint32_t kPageCount = kChunkCount << (kChunkShift - kPageShift);
+  static constexpr uint32_t kPagesPerChunk = 1u << (kChunkShift - kPageShift);
+  static constexpr uint32_t kNoChunk = 0xFFFFFFFFu;
+  static constexpr uint32_t kInitialPoolChunks = 512;  // 32 MiB
+  static constexpr uint64_t kEvictFrames = 600;
+
+  ResolveMemory() = default;
+  ~ResolveMemory();
+  ResolveMemory(const ResolveMemory&) = delete;
+  ResolveMemory& operator=(const ResolveMemory&) = delete;
+
+  // Why the waiting colour encodes are recorded. The summary
+  // counts, for each reason, its batches, the encodes they recorded and how
+  // many of those the reason needed: the encodes over the pages it reads or
+  // writes, and every older one over theirs (recorded later, it would lay
+  // older bytes over newer ones).
+  enum class FlushReason : uint8_t {
+    kEndOfFrame,      // Scene::EndFrame
+    kDepthEncode,     // a depth encode, recorded at once (Encode)
+    kDecode,          // a texture decoded from the pool (Bind)
+    kVertexCopy,      // a vertex stream built from the pool (CopyVertices)
+    kResolveOverlap,  // a resolve rewrites texels a waiting encode reads (BeforeResolve)
+    kUpload,          // a colour encode uploads guest pages a waiting encode writes
+    kLock,            // a CPU lock's write-back (Renderer)
+    kRemake,          // a product made again at another scale (ResolveCache::Activate)
+    kCount,
+  };
+
+  bool Initialize(Device& device, FrameRing& frames, BindlessHeap& heap, UploadRing& upload,
+                  GuestMemory& memory, HostPasses& passes, TextureCache& textures,
+                  PassTiming& pass_timing);
+  // GPU idle, FrameRing drained, before the BindlessHeap shuts down.
+  void Shutdown();
+
+  void BeginFrame(uint32_t slot);
+  // Takes the write notifications (TextureCache::Sync calls it once per draw).
+  void Sync();
+
+  // One resolve's copy (resolve.cpp Execute), after its conversion pass.
+  struct Copy {
+    const TextureKey* key = nullptr;  // the destination
+    uint32_t level = 0;
+    int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;  // texels of the level, x1/y1 exclusive
+    uint32_t mode = 0;  // the conversion and its flags (resolve.h ResolveCache::Mode)
+    // Colour: the product's view of every level, unswizzled.
+    uint32_t product_slot = 0;
+    // Depth: the EDRAM target's planes and how the copy reads them.
+    bool depth = false;
+    bool msaa = false;
+    uint32_t source_slot = 0;
+    uint32_t stencil_slot = 0;
+    int32_t offset_x = 0;  // EDRAM pixel = destination texel + offset
+    int32_t offset_y = 0;
+    uint32_t samples = 0;  // as resolve_ps.hlsl takes them
+    // Host texels per guest texel of what the encode reads: the product's
+    // (colour: the guest texel is the mean of its block) or the EDRAM
+    // target's (depth: the sample at the block's centre).
+    uint32_t resolution_scale = 1;
+  };
+  // Records the copy's bytes into the resolve memory, outside any render pass,
+  // leaving none open; binds its own compute state. False when it could not
+  // (logged, counted): the pages it would have written stay as they were.
+  bool Encode(plume::RenderCommandList* list, const Copy& copy);
+  // Before a resolve writes `level` of the product of `key` over [x0, x1) x
+  // [y0, y1): waiting encodes of that level that the rectangle covers are
+  // dropped (the new one writes their bytes again); one it overlaps otherwise
+  // sends the whole batch first.
+  void BeforeResolve(plume::RenderCommandList* list, const TextureKey& key, uint32_t level,
+                     int32_t x0, int32_t y0, int32_t x1, int32_t y1);
+  // Records every waiting encode (end of frame, and before anything reads the
+  // pool). Leaves no render pass open. With mcla_gpu_resolve_memory_encode_delay
+  // above 0 the end of a frame records only the encodes that
+  // waited that many frames, and a reader or writer of the pool only the ones
+  // over its pages (and every older one over theirs); a product made again at
+  // another scale still records them all.
+  void Flush(plume::RenderCommandList* list, FlushReason reason);
+  // Whether an encode still waiting reads the product of `key`:
+  // the product must outlive it (ResolveCache::EvictSome).
+  bool Waiting(const TextureKey& key) const;
+  // The same before a CPU lock of [address, address + size): the encodes over
+  // its pages are the ones it needed (counted).
+  void FlushForLock(plume::RenderCommandList* list, uint32_t address, uint32_t size);
+
+  // Whether a fetch of `key` (its base and mip ranges) reads bytes a resolve
+  // wrote that guest memory does not hold.
+  bool Holds(const TextureKey& key);
+
+  // Vertex streams over memory a resolve wrote: the console's
+  // resolve-to-vertex-buffer. MCLA's rain renders its particle state with
+  // xrain_system ParticleUpdatePS, resolves it as k_32_32_FLOAT and draws the
+  // drops with ParticleRenderVS, which reads that memory as four vertex
+  // streams. Whether a page of [address, address + length) holds bytes guest
+  // memory does not.
+  bool HoldsRange(uint32_t address, uint32_t length) const;
+  static constexpr uint32_t kMaxVertexCopyStride = 256;  // bytes: 2 mode bits x 64 dwords
+  struct VertexCopy {
+    uint32_t address = 0;   // the stream's guest physical address (source vertex 0)
+    uint32_t stride = 0;    // bytes: a multiple of 4, at most kMaxVertexCopyStride
+    uint32_t sources = 0;   // source vertices the fetch covers (its size / stride)
+    uint32_t first = 0;     // source vertex of destination vertex 0 (fold: the draw's start)
+    uint32_t vertices = 0;  // destination vertices
+    bool fold = false;      // destination vertex v reads source (first + v) / 4 (geometry.h)
+    // 2 bits per dword of a vertex: 0 as is, 1 8in16, 2 8in32 (the swap plan's units).
+    std::array<uint32_t, 4> modes{};
+  };
+  // The stream built on the GPU from the pool: the pages of its source range
+  // that are not valid come from guest memory first, the waiting encodes are
+  // recorded, and a compute dispatch writes the swapped bytes into a device
+  // buffer of this frame, *out. Leaves the list with its own compute state
+  // (the caller binds its own again). False with *why when it could not
+  // (counted).
+  bool CopyVertices(const VertexCopy& copy, plume::RenderCommandList* list,
+                    plume::RenderBufferReference* out, std::string* why);
+
+  enum class BindResult : uint8_t { kOk, kUnsupported, kFailed };
+  // `key` decoded from the resolve memory, its views by `host_swizzle`:
+  // *slot = the bindless slot. Records the decode into `list` when the texture
+  // is new or a page of its range changed since; that leaves the list with no
+  // framebuffer and the decode pass's own state (*state_changed = true).
+  BindResult Bind(const TextureKey& key, uint16_t host_swizzle, plume::RenderCommandList* list,
+                  uint32_t* slot, bool* state_changed, std::string* why);
+
+  // A CPU lock of [address, address + size): the
+  // pages of the range with bytes guest memory lacks are copied from the pool
+  // into guest memory, whole, before the CPU reads them -- the resolves' bytes
+  // in their order, whatever product made them. `submit_recorded` sends what
+  // the frame recorded so far to the queue; the caller records the encode
+  // batch first (Flush). Waits for the GPU. The pages written, or -1 when the
+  // copy could not be made (logged).
+  int64_t WriteBack(uint32_t address, uint32_t size,
+                    const std::function<void()>& submit_recorded);
+
+  // Reach (only with mcla_gpu_edram_aliasing). The ResolveCache
+  // hands over the EDRAM map at its Initialize. MarkInherited: the pages an
+  // inherited resolve wrote into `level` over [x0, x1) x [y0, y1) hold, on
+  // the console, another identity's bytes; a page written whole again
+  // (encode, upload, CPU) loses the mark. A decode or a lock over a marked
+  // page is reported (EdramTargets::NoteReach).
+  void SetEdram(EdramTargets* edram);
+  void MarkInherited(const TextureKey& key, uint32_t level, int32_t x0, int32_t y0, int32_t x1,
+                     int32_t y1);
+
+  std::string TakeSummary(uint64_t frames);
+
+ private:
+  enum PageFlag : uint8_t {
+    kValid = 1u << 0,
+    kNewer = 1u << 1,
+    kArmed = 1u << 2,
+    kInherited = 1u << 3,  // reach: an inherited resolve wrote it (MarkInherited)
+  };
+  enum class PoolAccess : uint8_t {
+    kNone,
+    kCopyWrite,
+    kCopyRead,
+    kComputeWrite,
+    kComputeRead,  // the vertex copy reads it
+    kGraphicsRead,
+  };
+  // A texture decoded from the resolve memory.
+  struct Decoded {
+    TextureKey key;
+    plume::RenderFormat format = plume::RenderFormat::UNKNOWN;
+    uint32_t kind = 0;  // resolve_memory_ps.hlsl kDecode*
+    std::unique_ptr<plume::RenderTexture> texture;
+    TextureViews views;
+    std::vector<std::unique_ptr<plume::RenderTextureView>> level_views;
+    std::vector<std::unique_ptr<plume::RenderFramebuffer>> level_framebuffers;
+    plume::RenderTextureLayout layout = plume::RenderTextureLayout::UNKNOWN;
+    uint32_t ranges[2][2] = {};
+    RegionIndex::Id region_ids[2] = {RegionIndex::kNone, RegionIndex::kNone};
+    uint64_t decoded_sequence = 0;  // 0 = never decoded
+    uint64_t decoded_frame = 0;     // the frame of its last decode
+    uint64_t last_frame = 0;
+  };
+
+  // Places `chunk` in the pool (growing it when full). False when the pool
+  // could not grow (logged).
+  bool EnsureChunk(plume::RenderCommandList* list, uint32_t chunk);
+  // The pages [x0, x1) x [y0, y1) of a level writes, into touched_ (from
+  // *first_page, *page_span entries: touched, and bytes covered). False when
+  // the rectangle reaches beyond the level's storage.
+  bool TouchPages(const TextureLevelStorage& storage, uint32_t bpb_log2, uint32_t pitch,
+                  int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint32_t* first_page,
+                  uint32_t* page_span);
+  bool GrowPool(plume::RenderCommandList* list);
+  bool MakeSets();
+  void UploadTable(plume::RenderCommandList* list);
+  // Uploads the given pages (not valid) from guest memory; each one uploaded
+  // becomes valid. The pages must have their chunks.
+  void UploadPages(plume::RenderCommandList* list, const std::vector<uint32_t>& pages);
+  void PoolBarrier(plume::RenderCommandList* list, PoolAccess access);
+  void ArmPages(const std::vector<uint32_t>& pages);
+  // Every decoded texture over [start, start + length): its memoized bindings
+  // are dropped (TextureCache::BumpProductGeneration of its pages). `cpu`: the
+  // CPU wrote the range (Sync), reported when it lands on a texture decoded in
+  // the last frames.
+  void TouchDecoded(uint32_t start, uint32_t length, bool cpu);
+  plume::RenderPipeline* DecodePipeline(plume::RenderFormat format);
+  void DestroyDecoded(Decoded& decoded, bool for_shutdown);
+  // The vertex copies' destination: per frame slot, device
+  // buffers (VERTEX | UNORDERED_ACCESS) used from the start each time the
+  // slot comes round, each with its descriptor set (u0, space 1).
+  struct VertexChunk {
+    std::unique_ptr<plume::RenderBuffer> buffer;
+    std::unique_ptr<plume::RenderDescriptorSet> set;
+    uint64_t size = 0;
+    uint64_t used = 0;
+  };
+  static constexpr uint64_t kVertexChunkBytes = uint64_t(4) << 20;
+  static constexpr uint64_t kVertexCopyAlignment = 256;
+  // A chunk of this frame with `bytes` free (made when none has), or null
+  // (logged).
+  VertexChunk* VertexChunkFor(uint64_t bytes);
+  void EvictSome();
+  void Fail(const char* what, const std::string& detail);
+  // A colour encode waiting in the batch.
+  struct Pending {
+    TextureKey key;
+    uint32_t level = 0;
+    int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    uint32_t first_page = 0;  // the pages it writes, as a range
+    uint32_t last_page = 0;
+    uint32_t groups_x = 0;
+    uint32_t groups_y = 0;
+    uint64_t frame = 0;  // frame_ when it was made
+    std::array<uint32_t, 16> push{};
+  };
+  std::vector<Pending> pending_;
+  // mcla_gpu_resolve_memory_encode_delay, read at each BeginFrame.
+  static constexpr uint32_t kMaxEncodeDelay = 120;  // well below kEvictFrames
+  uint32_t delay_ = 0;
+  bool counters_ = true;  // mcla_gpu_work_17oct: the batch counters; off = as before 17/10
+  // Pages a batch's cause reads or writes, first and last inclusive.
+  struct PageSpan {
+    uint32_t first = 0;
+    uint32_t last = 0;
+  };
+  // Marks in chosen_ the waiting encodes a batch needs: the ones
+  // `seed` picks and every older one whose pages meet a chosen one's.
+  // Returns how many.
+  template <typename Seed>
+  size_t Choose(Seed&& seed);
+  // Records for `reason` every waiting encode (`all`) or the ones chosen_
+  // marks, the rest waiting on in their order; `needed` of the recorded were
+  // needed (counted; SIZE_MAX when the reason names no pages).
+  void Record(plume::RenderCommandList* list, FlushReason reason, size_t needed, bool all);
+  // The batch before something over `spans` (a depth encode, a decode, a
+  // vertex copy, a lock): counted with the encodes it needed.
+  void FlushFor(plume::RenderCommandList* list, FlushReason reason, const PageSpan* spans,
+                size_t count);
+  std::vector<uint8_t> chosen_;         // Choose's marks, by waiting encode
+  std::vector<PageSpan> choose_spans_;  // Choose's scratch: the chosen ones' pages
+  std::vector<PageSpan> upload_spans_;  // a colour encode's uploaded pages, as runs
+  // The encodes of the last end-of-frame batch, for the count of the ones a
+  // resolve of the next frame writes again whole.
+  struct Recorded {
+    TextureKey key;
+    uint32_t level = 0;
+    int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+  };
+  std::vector<Recorded> last_batch_;
+  // The lock write-back's own list, fence and readback buffer: the copy runs
+  // after the work it reads, and the CPU waits for it.
+  bool EnsureReadback(uint64_t bytes);
+  std::unique_ptr<plume::RenderCommandList> readback_list_;
+  std::unique_ptr<plume::RenderCommandFence> readback_fence_;
+  std::unique_ptr<plume::RenderBuffer> readback_buffer_;
+  uint64_t readback_bytes_ = 0;
+  std::vector<std::pair<uint32_t, uint32_t>> wave_;  // page ranges of the current wave
+
+  Device* device_ = nullptr;
+  FrameRing* frames_ = nullptr;
+  BindlessHeap* heap_ = nullptr;
+  UploadRing* upload_ = nullptr;
+  GuestMemory* memory_ = nullptr;
+  GuestMemory::Subscriber subscriber_ = GuestMemory::kNoSubscriber;
+  HostPasses* passes_ = nullptr;
+  TextureCache* textures_ = nullptr;
+  PassTiming* pass_timing_ = nullptr;
+  EdramTargets* edram_ = nullptr;
+  bool reach_ = false;  // the detector is on: pages carry kInherited
+
+  // Descriptor sets and layouts: the encode's (pool read-write, table) and
+  // the decode's (pool and table read-only).
+  plume::RenderDescriptorSetBuilder encode_set_builder_;
+  plume::RenderDescriptorSetBuilder decode_set_builder_;
+  uint32_t encode_pool_index_ = 0;
+  uint32_t encode_table_index_ = 0;
+  uint32_t decode_pool_index_ = 0;
+  uint32_t decode_table_index_ = 0;
+  std::unique_ptr<plume::RenderDescriptorSet> encode_set_;
+  std::unique_ptr<plume::RenderDescriptorSet> decode_set_;
+  std::unique_ptr<plume::RenderPipelineLayout> encode_layout_;
+  std::unique_ptr<plume::RenderPipelineLayout> decode_layout_;
+  // Encode pipelines: [0] colour, [1] depth, [2] multisampled depth.
+  std::unique_ptr<plume::RenderShader> encode_shaders_[3];
+  std::unique_ptr<plume::RenderPipeline> encode_pipelines_[3];
+  std::unique_ptr<plume::RenderShader> decode_shader_;
+  std::unordered_map<uint32_t, std::unique_ptr<plume::RenderPipeline>> decode_pipelines_;
+  // The vertex copy: the decode's set (pool and table, space 0), the
+  // destination's (space 1), the push range (b0, space 2).
+  plume::RenderDescriptorSetBuilder vertex_set_builder_;
+  uint32_t vertex_buffer_index_ = 0;
+  std::unique_ptr<plume::RenderPipelineLayout> vertex_layout_;
+  std::unique_ptr<plume::RenderShader> vertex_shader_;
+  std::unique_ptr<plume::RenderPipeline> vertex_pipeline_;
+  std::vector<std::vector<VertexChunk>> vertex_chunks_;  // by frame slot
+
+  std::unique_ptr<plume::RenderBuffer> pool_;
+  uint32_t pool_chunks_ = 0;  // capacity
+  uint32_t used_chunks_ = 0;
+  PoolAccess pool_access_ = PoolAccess::kNone;
+  std::unique_ptr<plume::RenderBuffer> table_;
+  bool table_dirty_ = true;
+  bool table_read_barrier_ = false;  // the table was written since its last read barrier
+
+  std::vector<uint32_t> chunk_slot_;   // by chunk: its place in the pool, or kNoChunk
+  std::vector<uint8_t> page_flags_;    // by page: PageFlag
+  std::vector<uint64_t> page_sequence_;  // by page: the sequence of its last write
+  // By page: the xenos TextureFormat of the resolve that wrote it last (0xFF:
+  // none since the CPU's), and which destination and in which frame, for the
+  // report of a texture read in another shape or format.
+  std::vector<uint8_t> page_writer_;
+  std::vector<uint32_t> page_writer_key_;    // index in writer_keys_
+  std::vector<uint32_t> page_writer_frame_;  // frame_, low 32 bits
+  std::vector<TextureKey> writer_keys_;      // destinations seen (a few hundred)
+  std::unordered_map<TextureKey, uint32_t, TextureKeyHash> writer_key_index_;
+  std::vector<TextureKey> decode_logged_;  // keys whose first decode was reported (32 at most)
+  std::vector<TextureKey> late_logged_;    // keys reported written by the CPU after a decode
+  uint64_t sequence_ = 0;
+  uint32_t newer_low_page_ = UINT32_MAX;  // bounds of the pages ever marked newer
+  uint32_t newer_high_page_ = 0;
+
+  std::unordered_map<TextureKey, std::unique_ptr<Decoded>, TextureKeyHash> decoded_;
+  RegionIndex decoded_regions_;
+  std::vector<std::vector<Decoded*>> decoded_owners_;  // by region id
+
+  uint32_t slot_ = 0;
+  uint64_t frame_ = 1;
+  std::vector<GuestMemory::Range> drained_;
+  // Encode scratch: the pages a copy touches and the bytes of each it covers.
+  std::vector<std::pair<uint32_t, uint32_t>> touched_;
+  std::vector<uint32_t> pages_;
+  std::unordered_map<std::string, uint32_t> failures_logged_;  // by kind, the first 4 each
+
+  struct Stats {
+    uint64_t encodes = 0;
+    uint64_t encodes_dropped = 0;  // replaced by a later resolve of the same rectangle
+    uint64_t flushes = 0;          // batches recorded
+    uint64_t waves = 0;            // barriers inside batches (overlapping pages)
+    uint64_t encoded_bytes = 0;
+    uint64_t encode_failures = 0;
+    uint64_t pages_uploaded = 0;
+    uint64_t chunks_placed = 0;
+    uint64_t pool_growths = 0;
+    uint64_t holds_checks = 0;
+    uint64_t binds = 0;
+    uint64_t decodes = 0;
+    uint64_t decoded_levels = 0;
+    uint64_t bind_unsupported = 0;
+    uint64_t bind_failures = 0;
+    uint64_t cpu_writes = 0;        // pages the CPU wrote that the pool held
+    uint64_t cpu_writes_newer = 0;  // ... of which with bytes guest memory did not hold
+    uint64_t evicted = 0;
+    uint64_t lock_write_backs = 0;     // locks that copied pages back
+    uint64_t lock_pages = 0;           // pages copied back
+    uint64_t lock_pages_unknown = 0;   // newer pages the pool does not hold whole (logged)
+    uint64_t inherited_marked = 0;     // reach: pages marked by inherited resolves
+    uint64_t vertex_copies = 0;        // vertex streams built from the pool
+    uint64_t vertex_copy_bytes = 0;
+    uint64_t vertex_copy_failures = 0;
+    // Batches by reason: recorded, the encodes they recorded,
+    // and of those the ones the reason needed.
+    std::array<uint64_t, size_t(FlushReason::kCount)> batches_by{};
+    std::array<uint64_t, size_t(FlushReason::kCount)> recorded_by{};
+    std::array<uint64_t, size_t(FlushReason::kCount)> needed_by{};
+    uint64_t rewritten_next_frame = 0;   // end-of-frame encodes a next-frame resolve wrote whole
+    uint64_t uploads_under_waiting = 0;  // pages uploaded under a waiting encode's
+    uint64_t waiting_sum = 0;            // encodes still waiting after each end of frame
+    uint64_t waiting_max = 0;
+  };
+  Stats stats_;
+};
+
+}  // namespace mcla::gpu

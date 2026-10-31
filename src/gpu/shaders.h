@@ -1,0 +1,157 @@
+#pragma once
+// ===========================================================================
+// MCLA GPU renderer -- the guest shader store (shader pack v8)
+// ===========================================================================
+// The translated guest shaders (LAR-XenosRecomp HLSL compiled offline by
+// tools/build_shader_pack_v7.py), keyed by the runtime shader identity
+// (FNV-1a 64 of the vfetch-normalized microcode, native_gfx/shader_identity.h).
+// Layout of the file: the builder's header (for v3, 24.27 for what v6 changes, 24.41 for v7). v7 is the shader
+// contract this renderer is written against: v6's plus the host target's
+// resolution scale (24.41: g_InvResolutionScale at byte 592, SharedConstants
+// of 608 bytes; the pixel position a pixel shader receives is in guest
+// pixels). v6 is v4's (-- SharedConstants of 592 bytes
+// with g_PosScale / g_PosOffset, structured control flow, conditional exec
+// blocks that test their condition) plus alpha to coverage in the pixel shader
+// (24.27: g_AlphaToMask at byte 540; SV_Coverage beside oC0 only in the pixel
+// shader variant 1, the one whose coverage depends on alpha). The legacy
+// runtime's v2 pack keeps the old contract.
+//
+// The pack is memory-mapped read-only from <exe folder>/assets (the legacy
+// runtime opens v2 relative to the working directory, a known pending issue);
+// only the pages of the blobs actually used are read. The header, every entry
+// and every range are validated at open; a blob's FNV and magic are verified
+// the first time it is used, and a bad blob marks its entry unusable, logged
+// with its key.
+//
+// Shaders: one plume::RenderShader per blob, created on first use on the
+// render thread through Device::CreateShader (which rejects a null-backed
+// result). Both backends have one blob per spec variant present (DXIL for
+// D3D12, SPIR-V for Vulkan): the spec constants are fixed when the pack is
+// compiled, because the variants differ in their outputs, which a
+// specialization constant cannot change.
+//
+// Threading: after Initialize, GetShader from any thread (the pipeline
+// precache's workers call it); the rest from the render thread.
+// ===========================================================================
+
+#include <cstdint>
+#include <mutex>
+#include <filesystem>
+#include <memory>
+#include <unordered_map>
+#include <vector>
+
+#include <plume_render_interface.h>
+
+namespace rex::memory {
+class MappedMemory;
+}
+
+namespace mcla::gpu {
+
+class Device;
+
+class ShaderStore {
+ public:
+  static constexpr const char* kPackFileName = "mcla_shaders.v8.pack";
+  static constexpr uint32_t kPackVersion = 8;
+
+  enum class Stage : uint8_t { kVertex, kPixel };
+
+  struct Blob {
+    uint32_t offset = 0;
+    uint32_t size = 0;
+    uint64_t fnv = 0;
+  };
+
+  enum EntryFlags : uint32_t {
+    kComputedFetchIndex = 1u << 0,  // a vfetch takes its index from something other than r0.x
+  };
+
+  // Pixel shader outputs (pack flags bits 8..12, PixelShader::outputs of the container).
+  enum PixelOutputs : uint8_t {
+    kOutputColor0 = 1u << 0,
+    kOutputColor1 = 1u << 1,
+    kOutputColor2 = 1u << 2,
+    kOutputColor3 = 1u << 3,
+    kOutputDepth = 1u << 4,
+  };
+
+  struct Entry {
+    uint64_t key = 0;
+    Stage stage = Stage::kVertex;
+    // Spec bits the shader uses: VS 0x1 R11G11B10_NORMAL, PS 0x2 ALPHA_TEST (the
+    // variant whose coverage depends on alpha: alpha test and/or alpha to
+    // coverage, constants.h).
+    uint8_t spec_mask = 0;
+    uint16_t velem_count = 0;
+    uint32_t velem_offset = 0;
+    uint32_t flags = 0;
+    uint8_t ps_outputs = 0;           // PixelOutputs; 0 for vertex shaders
+    uint32_t texture_fetch_mask = 0;  // bit i: a texture instruction reads fetch constant i
+    Blob dxil[2];   // variant 0 (no spec bit) / variant 1 (spec_mask)
+    Blob spirv[2];  // the same variants
+  };
+
+  struct VertexElement {
+    uint32_t address = 0;  // vfetch instruction address in the microcode
+    uint32_t usage = 0;    // D3DDECLUSAGE
+    uint32_t usage_index = 0;
+  };
+
+  enum class ShaderResult : uint8_t {
+    kOk,
+    kNoVariant,     // the variant asked for was not compiled for this shader
+    kBadBlob,       // FNV or magic mismatch (logged once)
+    kCreateFailed,  // the backend refused it (logged once)
+  };
+  static const char* ResultName(ShaderResult result);
+
+  struct Stats {
+    uint64_t shaders_created = 0;
+    uint64_t blobs_verified = 0;
+    uint64_t blob_failures = 0;
+    uint64_t create_failures = 0;
+  };
+
+  ShaderStore();
+  ~ShaderStore();
+  ShaderStore(const ShaderStore&) = delete;
+  ShaderStore& operator=(const ShaderStore&) = delete;
+
+  // Opens and validates the pack. False (logged) when it is missing or malformed.
+  bool Initialize(Device& device);
+  // The GPU must be idle: shaders are destroyed directly.
+  void Shutdown();
+
+  uint32_t entry_count() const { return uint32_t(entries_.size()); }
+  const std::filesystem::path& path() const { return path_; }
+  const Stats& stats() const { return stats_; }
+
+  const Entry* Find(uint64_t identity) const;
+  // Appends the vertex shader's elements to `out` (cleared first).
+  void GetVertexElements(const Entry& entry, std::vector<VertexElement>& out) const;
+  // The shader for `entry` with spec `variant` (0, or 1 = spec_mask applied),
+  // created on first use. Null with the reason in `result` otherwise.
+  plume::RenderShader* GetShader(const Entry& entry, uint32_t variant, ShaderResult* result);
+
+ private:
+  struct Slot {
+    std::unique_ptr<plume::RenderShader> shader;
+    ShaderResult result = ShaderResult::kOk;
+    bool done = false;
+  };
+
+  bool Validate();
+  bool VerifyBlob(const Entry& entry, const Blob& blob, bool spirv);
+
+  Device* device_ = nullptr;
+  std::mutex mutex_;  // GetShader's slots and stats
+  std::filesystem::path path_;
+  std::unique_ptr<rex::memory::MappedMemory> file_;
+  std::unordered_map<uint64_t, Entry> entries_;
+  std::unordered_map<uint64_t, Slot> slots_[2];  // per variant, by identity
+  Stats stats_;
+};
+
+}  // namespace mcla::gpu

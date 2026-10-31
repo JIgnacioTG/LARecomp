@@ -56,7 +56,7 @@ larecomp_config-graine.toml
 *.xex
 *.rpf
 *.bik
-MCLA_Game_Files/
+/MCLA_Game_Files
 
 # IDE & Editor files
 .vs/
@@ -78,3 +78,12 @@ src/assets/
 translations/
 # Runtime diagnostic output
 rubberband_dump.txt
+
+# Nick registry of a master run from the tree: its signing key and database.
+# The key must never be published (anyone with it can mint nick tickets).
+identity_master.key
+identity_db.txt
+identity_db.txt.tmp
+
+# Design notes and RE maps are kept local, out of the repository.
+docs/

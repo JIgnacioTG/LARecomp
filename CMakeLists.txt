@@ -19,6 +19,10 @@ endif()
 include(generated/rexglue.cmake)
 
 # Sources
+# Monocypher (nick keys and tickets, thirdparty/monocypher) is C99 that also
+# compiles as C++; the project only enables CXX.
+set_source_files_properties(thirdparty/monocypher/monocypher.c PROPERTIES LANGUAGE CXX)
+
 set(LARECOMP_SOURCES
     src/main.cpp
     src/spdlog_console.cpp
@@ -26,10 +30,17 @@ set(LARECOMP_SOURCES
 
     src/mc_engine/threading.cpp
 
+    # Steering wheel support.
+    src/mc_engine/wheel/wheel_fake.cpp
+    src/mc_engine/wheel/wheel_input.cpp
+    src/mc_engine/wheel/wheel_ffb.cpp
+    src/mc_engine/wheel/wheel_dinput.cpp
+
     # Guest hooks, one file per category. hooks.cpp holds InitHooks and the
     # per-frame Patch_DeltaTimePre; hooks_internal.h is what the files share.
     src/mc_engine/hooks/hooks.cpp
     src/mc_engine/hooks/ui.cpp
+    src/mc_engine/hooks/ui_theme.cpp
     src/mc_engine/hooks/world_tuning.cpp
     src/mc_engine/hooks/render_phases.cpp
     src/mc_engine/hooks/frame_timing.cpp
@@ -48,17 +59,24 @@ set(LARECOMP_SOURCES
     src/mc_engine/hooks/diagnostics.cpp
     src/mc_engine/hooks/warper.cpp
     src/mc_engine/hooks/photo_album.cpp
+    src/mc_engine/hooks/rear_view.cpp
 
     src/mc_engine/guest_profiler.cpp
     src/mc_engine/carbon_parts.cpp
     src/mc_engine/graphics_button.cpp
     src/mc_engine/pause_menu.cpp
+    src/mc_engine/ui_palette.cpp
+    src/mc_engine/swf_dom.cpp
+    src/mc_engine/swf_import.cpp
+    src/mc_engine/ui_forms.cpp
     src/mc_engine/string_table.cpp
     src/mc_engine/string_dumper.cpp
     src/mc_engine/menu_camera.cpp
     src/mc_engine/map_mouse.cpp
     src/mc_engine/camera_look.cpp
+    src/mc_engine/keyboard_native.cpp
     src/mc_engine/time_of_day.cpp
+    src/mc_engine/map_warp.cpp
     src/mc_engine/real_weather.cpp
     src/mc_engine/squash_stretch.cpp
     src/mc_engine/tire_offset.cpp
@@ -99,7 +117,38 @@ set(LARECOMP_SOURCES
     src/mc_engine/online/online_common.cpp
     src/mc_engine/online/tournament.cpp
     src/mc_engine/online/system_link.cpp
+    src/mc_engine/online/relay_info.cpp
+    src/mc_engine/online/online_toast.cpp
     src/mc_engine/online/xbox_live.cpp
+    src/mc_engine/online/race_props.cpp
+    src/mc_engine/online/session_limits.cpp
+    # Server browser (F6): relay list, rooms, joining a picked room.
+    src/mc_engine/online/server_browser/browser_client.cpp
+    src/mc_engine/online/server_browser/browser_join.cpp
+    src/mc_engine/online/server_browser/browser_ui.cpp
+    # Online identity (F7): the key that owns the gamertag, its XUID, the
+    # nick proof to relays that check, backup and recovery code.
+    src/mc_engine/online/identity/identity_store.cpp
+    src/mc_engine/online/identity/identity_client.cpp
+    src/mc_engine/online/identity/identity_ui.cpp
+    thirdparty/monocypher/monocypher.c
+    # Mod browser (F5) and the mod check/download the server browser uses too.
+    src/mc_engine/modloader/modsbrowser/mod_download.cpp
+    src/mc_engine/modloader/modsbrowser/mod_browser_ui.cpp
+
+    # Rate My Ride: the rlUpload "RateMyRide" table served by our own backend
+    # (local store, or larecomp_rmr_server shared with the other players).
+    src/mc_engine/online/rate_my_ride/rate_my_ride.cpp
+    src/mc_engine/online/rate_my_ride/rmr_client.cpp
+    src/mc_engine/online/rate_my_ride/rmr_protocol.cpp
+    src/mc_engine/online/rate_my_ride/rmr_store.cpp
+    src/mc_engine/online/rate_my_ride/rmr_net.cpp
+
+    # Leaderboards: the LIVE stats views served by the same backend.
+    src/mc_engine/online/leaderboards/leaderboards.cpp
+    src/mc_engine/online/leaderboards/lb_client.cpp
+    src/mc_engine/online/leaderboards/lb_protocol.cpp
+    src/mc_engine/online/leaderboards/lb_store.cpp
 
     # MILESTONE 0 - temporary passive instrumentation, cvar-gated (default off).
     # Remove this line and the src/native_probe/ directory once the Native
@@ -168,7 +217,17 @@ set(LARECOMP_SOURCES
     src/isoinstaller/larecomp_iso_installer.cpp
     src/isoinstaller/install_wizard_dialog.cpp
     src/saveporter/larecomp_save_porter.cpp
+    src/profile/larecomp_profile_store.cpp
+    src/profile/larecomp_profile_picker.cpp
     src/bootprogress/larecomp_boot_progress.cpp
+    src/mc_engine/ui/fonts/larecomp_embedded_fonts.cpp
+    src/mc_engine/ui/imgui_theme.cpp
+    src/mc_engine/ui/debug_overlay.cpp
+    src/mc_engine/ui/controller_toast.cpp
+    src/mc_engine/ui/gamepad.cpp
+    src/mc_engine/ui/settings.cpp
+    src/mc_engine/ui/achievements.cpp
+    src/mc_engine/ui/kerning.cpp
 )
 # The experimental native renderer is D3D12-only; Linux retains the
 # supported Xenos GPU plugin with its Vulkan backend.
@@ -210,7 +269,28 @@ else()
             endif()
         endif()
         enable_language(RC)
-        add_executable(larecomp WIN32 ${LARECOMP_SOURCES} src/larecomp.rc)
+
+        # Keyboard key caps (src/keycaps/*.png) embedded in the exe, one RCDATA
+        # per file named KEYCAP_<FILE NAME> (a.png -> KEYCAP_A, a_w.png ->
+        # KEYCAP_A_W); keyboard_native.cpp reads them from there. The .rc is
+        # regenerated whenever a PNG is added or removed.
+        file(GLOB _larecomp_keycaps CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/src/keycaps/*.png")
+        set(_larecomp_keycaps_rc "// Generated by CMakeLists.txt from src/keycaps/. Do not edit.\n")
+        foreach(_cap ${_larecomp_keycaps})
+            get_filename_component(_cap_name "${_cap}" NAME_WE)
+            string(TOUPPER "${_cap_name}" _cap_name)
+            string(APPEND _larecomp_keycaps_rc "KEYCAP_${_cap_name} RCDATA \"${_cap}\"\n")
+        endforeach()
+        file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/keycaps.rc"
+             CONTENT "${_larecomp_keycaps_rc}" @ONLY)
+        # The resource compiler does not report RCDATA inputs as dependencies,
+        # so an edited PNG would not relink the exe without this.
+        set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/keycaps.rc"
+                                    PROPERTIES OBJECT_DEPENDS "${_larecomp_keycaps}")
+
+        add_executable(larecomp WIN32 ${LARECOMP_SOURCES} src/larecomp.rc
+                       "${CMAKE_CURRENT_BINARY_DIR}/keycaps.rc")
     else()
         add_executable(larecomp ${LARECOMP_SOURCES})
     endif()
@@ -224,6 +304,54 @@ else()
         find_package(PkgConfig REQUIRED)
         pkg_check_modules(GTK3 REQUIRED IMPORTED_TARGET gtk+-3.0)
         target_link_libraries(larecomp PRIVATE PkgConfig::GTK3)
+    endif()
+
+    # The Plume renderer, src/gpu.
+    # Every backend the platform has is built in -- D3D12 and Vulkan on Windows,
+    # Vulkan elsewhere -- and the SDK's graphics_backend cvar picks one at
+    # startup; the host shaders are compiled once per
+    # backend format. Plume itself is the submodule thirdparty/plume: the
+    # project's fork (mzzvxm/plume, branch larecomp) of the zolaware revision
+    # reblue ships (SDL3 Vulkan path, fill mode, R11G11B10/D24S8), plus the
+    # teardown leak fixes; the host shaders are compiled by
+    # the dxc of the submodule thirdparty/dxc-bin (renderbag, the revision reblue
+    # and reeot use). Off outside Windows until that path has been compiled.
+    if(WIN32)
+        set(_larecomp_gpu_default ON)
+    else()
+        set(_larecomp_gpu_default OFF)
+    endif()
+    option(LARECOMP_GPU "Build the Plume renderer (src/gpu)" ${_larecomp_gpu_default})
+    if(LARECOMP_GPU)
+        # Metal is not wired.
+        if(WIN32)
+            set(LARECOMP_GPU_BACKENDS D3D12 VULKAN)
+        else()
+            set(LARECOMP_GPU_BACKENDS VULKAN)
+        endif()
+        foreach(_larecomp_gpu_dep plume/plume_render_interface.h dxc-bin/CMakeLists.txt)
+            if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/${_larecomp_gpu_dep}")
+                message(FATAL_ERROR "thirdparty/${_larecomp_gpu_dep} is missing: "
+                                    "git submodule update --init --recursive")
+            endif()
+        endforeach()
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            # Plume builds the Vulkan surface through the SDK's SDL3 window.
+            set(PLUME_SDL_VULKAN_ENABLED ON CACHE BOOL "" FORCE)
+        endif()
+        add_subdirectory(thirdparty/plume EXCLUDE_FROM_ALL)
+        # Defines DIRECTX_DXC_TOOL. Skipped if something else already brought
+        # the same dxc-bin in (an in-tree XenosRecomp carries it too).
+        if(NOT TARGET Microsoft::DirectXShaderCompiler)
+            add_subdirectory(thirdparty/dxc-bin EXCLUDE_FROM_ALL)
+        endif()
+        add_subdirectory(src/gpu)
+        # The renderer's objects, and plume's archive without plume's include
+        # directories in larecomp's own translation units (CMP0131 is NEW with
+        # cmake_minimum_required 3.25). The rest of larecomp sees only gpu.h.
+        target_link_libraries(larecomp PRIVATE larecomp_gpu $<LINK_ONLY:plume>)
+        target_compile_definitions(larecomp PRIVATE LARECOMP_HAS_GPU=1)
+        message(STATUS "larecomp: Plume renderer (src/gpu) built for ${LARECOMP_GPU_BACKENDS}")
     endif()
 
     # rexglue 0.7.4
@@ -251,7 +379,44 @@ else()
             mfreadwrite
             mfuuid
             ole32
+            # Rate My Ride client sockets (mc_engine/online/rate_my_ride)
+            ws2_32
         )
+    endif()
+
+    # The shared Rate My Ride server players reach on TCP 31002. Standalone: the
+    # store and protocol sources only, no SDK.
+    add_executable(larecomp_rmr_server
+        src/mc_engine/online/rate_my_ride/rmr_server_main.cpp
+        src/mc_engine/online/rate_my_ride/rmr_protocol.cpp
+        src/mc_engine/online/rate_my_ride/rmr_store.cpp
+        src/mc_engine/online/rate_my_ride/rmr_net.cpp
+        src/mc_engine/online/leaderboards/lb_protocol.cpp
+        src/mc_engine/online/leaderboards/lb_store.cpp
+    )
+    if(WIN32)
+        target_compile_definitions(larecomp_rmr_server PRIVATE _CRT_SECURE_NO_WARNINGS)
+        target_link_libraries(larecomp_rmr_server PRIVATE ws2_32)
+    endif()
+
+    # The online relay (UDP 31000) anyone can host, and the master server
+    # (UDP+TCP 31003) that lists those relays in the in-game server browser.
+    # Standalone, no SDK.
+    add_executable(larecomp_relay_server
+        src/mc_engine/online/relay_server/relay_server.cpp
+        thirdparty/monocypher/monocypher.c
+    )
+    add_executable(larecomp_master_server
+        src/mc_engine/online/master_server/master_server_main.cpp
+        src/mc_engine/online/master_server/identity_registry.cpp
+        src/mc_engine/online/rate_my_ride/rmr_net.cpp
+        src/mc_engine/online/rate_my_ride/rmr_protocol.cpp
+        thirdparty/monocypher/monocypher.c
+    )
+    if(WIN32)
+        target_link_libraries(larecomp_relay_server PRIVATE ws2_32)
+        target_compile_definitions(larecomp_master_server PRIVATE _CRT_SECURE_NO_WARNINGS)
+        target_link_libraries(larecomp_master_server PRIVATE ws2_32)
     endif()
 
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/assets")

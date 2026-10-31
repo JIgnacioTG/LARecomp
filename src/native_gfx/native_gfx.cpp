@@ -616,6 +616,13 @@ REXCVAR_DEFINE_BOOL(mcla_native_gfx_inline_fenced, true, "MCLA/NativeGfx",
                     "restores the old ring, for A/B.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(mcla_native_gfx_inline_direct, false, "MCLA/NativeGfx",
+                    "Copy every inline (BeginVertices) draw straight into the upload ring "
+                    "instead of using BufferCache. Off is the default because the direct path "
+                    "can stall MCLA; cached inline regions use exact per-block hashes on every "
+                    "draw so same-frame command-buffer rewrites do not flicker the 2D/UI.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(mcla_native_gfx_tex_cached_decode, true, "MCLA/NativeGfx",
                     "Untile and endian-swap texture levels in ordinary cached memory and copy "
                     "the result to the upload ring in one pass, instead of swapping in place "
@@ -695,7 +702,9 @@ REXCVAR_DEFINE_UINT32(mcla_native_gfx_streaming_frames, 3, "MCLA/NativeGfx",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(mcla_native_gfx_streaming_sticky, false, "MCLA/NativeGfx",
-                    "Hysteresis for the streaming classifier above. Promotion counts a region "
+                    "Hysteresis for fully hashed regions only. Sampled-hash geometry keeps the "
+                    "normal four-frame demotion so old configurations cannot leave it permanently "
+                    "outside the write watch. Promotion counts an exact-hash region "
                     "written every other frame as a streak (a double-buffered dynamic buffer "
                     "never had two consecutive dirty frames, so it stayed watched and paid a "
                     "fault, a VirtualProtect and a re-upload on every write), and demotion "
@@ -707,14 +716,15 @@ REXCVAR_DEFINE_BOOL(mcla_native_gfx_streaming_sticky, false, "MCLA/NativeGfx",
                     "above noise -- and with it on for a whole session stale meshes showed up "
                     "(stretched triangles across the screen, HUD pieces missing): more regions "
                     "off the watch means more rewrites left to the sampled hash, which misses "
-                    "them. Keep it off.")
+                    "them. Sampled-hash regions therefore ignore this setting.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_UINT32(mcla_native_gfx_streaming_demote_frames, 30, "MCLA/NativeGfx",
-                      "With mcla_native_gfx_streaming_sticky on: clean frames (frames in which "
+                      "With mcla_native_gfx_streaming_sticky on, for fully hashed regions: clean frames (frames in which "
                       "the region was drawn and its hashed blocks matched) before a streaming "
                       "region goes back under the write watch. 0 never puts it back, which "
-                      "leaves every rewrite of the region to the sampled hash alone.")
+                      "leaves every rewrite to the full hash. Sampled-hash geometry always demotes "
+                      "after four clean frames regardless of this value.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(mcla_native_gfx_state_cache, true, "MCLA/NativeGfx",
@@ -995,13 +1005,36 @@ class RenderGateGuard {
       AcquireSRWLockExclusive(&g_render_gate);
     }
   }
+  explicit RenderGateGuard(uint32_t max_wait_ms) : acquired_(false) {
+    if (t_render_gate_depth != 0) {
+      ++t_render_gate_depth;
+      acquired_ = true;
+      return;
+    }
+    const ULONGLONG started = GetTickCount64();
+    for (;;) {
+      if (TryAcquireSRWLockExclusive(&g_render_gate)) {
+        t_render_gate_depth = 1;
+        acquired_ = true;
+        return;
+      }
+      if (GetTickCount64() - started >= max_wait_ms) {
+        return;
+      }
+      Sleep(1);
+    }
+  }
   ~RenderGateGuard() {
-    if (--t_render_gate_depth == 0) {
+    if (acquired_ && --t_render_gate_depth == 0) {
       ReleaseSRWLockExclusive(&g_render_gate);
     }
   }
+  explicit operator bool() const { return acquired_; }
   RenderGateGuard(const RenderGateGuard&) = delete;
   RenderGateGuard& operator=(const RenderGateGuard&) = delete;
+
+ private:
+  bool acquired_ = true;
 };
 
 // The host thread that last ran a frame boundary, for the write-back log.
@@ -1015,6 +1048,10 @@ bool TryInitialize() {
   if (!runtime) {
     REXLOG_ERROR("[native_gfx] no Runtime instance");
     return false;
+  }
+  if (REXCVAR_GET(mcla_native_gfx_streaming_sticky)) {
+    REXLOG_INFO("[native_gfx] streaming hysteresis applies only to fully hashed buffers; "
+                "sampled geometry keeps four-frame write-watch demotion");
   }
   // Where the D3D12 provider and presenter come from, and the difference is
   // the whole point of the no-command-processor mode.
@@ -1061,13 +1098,23 @@ bool TryInitialize() {
   // comparisons and refuses to attach for a backend nobody ever selected.
   // Ask whether the flag exists before believing its value: where there is no
   // backend selector there is nothing to disagree with, and the provider cast
-  // below is the real check either way. A registered flag still refuses, so
-  // behaviour on this tree is unchanged.
+  // below is the real check either way. A registered flag still refuses next
+  // to an emulated GPU of another backend. With no emulated GPU (nocp) the cvar
+  // has nothing of the SDK's to pick -- it is the pause menu's GRAPHICS API row,
+  // shared with the emulated path and the Plume renderer
+  // -- and this runtime has only
+  // D3D12: said loudly, and run there, instead of leaving the game with no
+  // renderer at all.
   if (rex::cvar::GetFlagInfo("graphics_backend")) {
     const std::string backend = REXCVAR_QUERY(std::string, graphics_backend);
     if (backend != "auto" && backend != "d3d12") {
-      REXLOG_ERROR("[native_gfx] graphics_backend is '{}', native runtime needs d3d12", backend);
-      return false;
+      if (!nocp_mode) {
+        REXLOG_ERROR("[native_gfx] graphics_backend is '{}', native runtime needs d3d12", backend);
+        return false;
+      }
+      REXLOG_WARN("[native_gfx] graphics_backend is '{}', but the legacy native runtime has only "
+                  "D3D12; it runs on D3D12",
+                  backend);
     }
   }
   auto* provider = nocp_mode ? nocp::Provider()
@@ -2533,6 +2580,17 @@ void NoteD3DTextureCreated(const uint8_t* base, uint32_t d3d_texture_va) {
   NoteTextureCreate(base, d3d_texture_va);
 }
 
+void NotifyWindowCloseRequested() {
+  // The SDK deliberately exits without waiting for a stuck renderer. Preserve
+  // that escape path if a draw is holding the gate while waiting on a GPU fence.
+  RenderGateGuard gate(250);
+  if (!gate) {
+    REXLOG_WARN("[native_gfx] skipping PSO persistence on close: render gate busy for 250 ms");
+    return;
+  }
+  g_pipelines.PersistBeforeExit();
+}
+
 void NotifyFrameBoundary() {
   RenderGateGuard gate;
   g_render_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
@@ -2542,12 +2600,9 @@ void NotifyFrameBoundary() {
   // ones -- different bugs, different fixes.
   g_buffers.ReportPeriodic();
 
-  if (g_pipelines.is_library_dirty()) {
-    static uint32_t pso_save_tick = 0;
-    if ((++pso_save_tick % 300u) == 0u) {
-      g_pipelines.SaveLibrary();
-    }
-  }
+  // Serialize and persist PSOs only at shutdown. Serializing the whole driver
+  // library and writing its file here stalled the game's render thread while
+  // it held the render gate, precisely when new sectors made the library dirty.
   {
     static uint64_t pso_report = 0;
     if ((pso_report++ % 600u) == 0u) {
@@ -2670,7 +2725,9 @@ void NotifyFrameBoundary() {
   // happens in the CP's swap (NativeGuestOutputCallback), not here.
   if (ContinuousMode()) {
     if (g_present_ready && g_draw_ready) {
+      HangMark(g_hang_render, "boundary: PrepareContinuousDisplay");  // TEMP DIAG
       const bool prepared = PrepareContinuousDisplay(g_draw_context, g_render_targets);
+      HangMark(g_hang_render, "boundary: prepared");  // TEMP DIAG
       // Present HERE, not from the swap hook.
       //
       // The guest swap is issued from INSIDE rage::grcDevice::EndFrame
@@ -2693,7 +2750,9 @@ void NotifyFrameBoundary() {
       // always closed. This also keeps the blit inside the RenderDoc bracket
       // below and ahead of stamp_releases(), whose fence value must cover it.
       if (prepared) {
+        HangMark(g_hang_render, "boundary: PresentContinuousDisplay");  // TEMP DIAG
         PresentContinuousDisplay();
+        HangMark(g_hang_render, "boundary: presented");  // TEMP DIAG
       }
       // Programmatic RenderDoc capture of one native frame. The native present
       // bypasses the swapchain, so RenderDoc's Present-driven frame delimiter
@@ -2727,9 +2786,11 @@ void NotifyFrameBoundary() {
       // sampler caches so next frame allocates fresh descriptors (a freed+recycled
       // resource can no longer alias a stale pointer-keyed SRV) without clobbering
       // this frame's still-in-flight half.
+      HangMark(g_hang_render, "boundary: reset");  // TEMP DIAG
       g_binder.BeginFrame();
       g_textures.BeginGameFrame();
       ResetContinuousFrame(g_render_targets);
+      HangMark(g_hang_render, "boundary: done");  // TEMP DIAG
       // Arm the next frame's capture if the trigger file is present. std::remove
       // returns 0 only when it existed and was deleted, consuming it atomically.
       // Two producers, one consumer: the keybind (any thread, atomic flag) and

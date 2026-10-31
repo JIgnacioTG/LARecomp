@@ -63,9 +63,9 @@ constexpr uint32_t kGuestDtMin      = 0x827D7528;  // [r3+40]
 void ApplyAspectRatioPatch(std::string_view ratio);
 
 // readback_window.cpp
-// Who is holding the global resolve readback (d3d12_readback_resolve) open.
+// Who is holding the global resolve readback (d3d12_/vulkan_readback_resolve) open.
 enum class ReadbackClient : uint8_t { kVinyl, kPhoto, kCount };
-// Keeps d3d12_readback_resolve on for at least `hold_ns` from now on behalf of
+// Keeps the resolve readback on for at least `hold_ns` from now on behalf of
 // `client`. Leaves it alone if the user turned it on themselves.
 void HoldGlobalReadback(ReadbackClient client, int64_t hold_ns);
 // Per frame: turns it back off once every client's hold has run out, if it was
@@ -75,6 +75,9 @@ void TickGlobalReadback();
 // photo_album.cpp
 // From TakePicture until the grab is done (snapshot vhsm phase 6 or 3).
 bool PhotoCaptureInProgress(const uint8_t* base);
+// A tenth of a second from photoAlbum.EnableCity: the city draws again while the
+// album movie still shows the full-screen photo.
+bool PhotoCityReturning();
 // photo_ui_trace is on and the photo album scene is up.
 bool PhotoUiTracing(const uint8_t* base);
 
@@ -99,6 +102,9 @@ extern std::atomic<uint64_t> g_frame_heartbeat;  // bumped by Patch_DeltaTimePre
 void ApplyRenderPhaseMask();
 void LogRenderPhaseMaskOnce();
 void StartFreezeWatchdog();
+
+// rear_view.cpp
+void TickRearView();
 
 // world_tuning.cpp
 void ApplyAmbientDensityTuning();

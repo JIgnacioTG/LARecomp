@@ -60,7 +60,9 @@ REXCVAR_DEFINE_BOOL(single_tile, false, "MCLA/Performance",
 // deletion - set it true in larecomp.toml to measure that.
 REXCVAR_DEFINE_BOOL(submit_on_primary_buffer_end, false, "MCLA/Performance",
     "Drive the SDK's d3d12_submit_on_primary_buffer_end. Ends a D3D12 submission at every PM4 "
-    "primary buffer end instead of batching the frame. Measured ~7% slower on a GTX 1650.")
+    "primary buffer end instead of batching the frame. Measured ~7% slower on a GTX 1650. "
+    "With graphics_backend = vulkan the SDK's own vulkan_submit_on_primary_buffer_end (on by "
+    "default) applies instead; not measured here, so it is left alone.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 // Function to apply/revert the Aspect Ratio patch in GPU memory
@@ -192,8 +194,19 @@ bool Patch_DisableMotionBlur(PPCRegister& r3) {
     return false;
 }
 
+// The game's MSAA switch. Under the NATIVE renderer its MSAA row
+// (mcla_gpu_msaa, OFF/2X/4X/8X) owns it and disable_msaa -- the XENIA row,
+// hidden there -- is not read; both cvars are read by name or flag here, the
+// renderer's lives with the renderer.
+static bool MsaaOff() {
+    if (rex::cvar::GetFlagByName("mcla_gpu") == "true") {
+        return rex::cvar::GetFlagByName("mcla_gpu_msaa") == "off";
+    }
+    return REXCVAR_GET(disable_msaa);
+}
+
 bool Patch_DisableMSAA(PPCRegister& r11) {
-    if (REXCVAR_GET(disable_msaa)) {
+    if (MsaaOff()) {
         r11.u64 = 1; // li r11, 1
         return true;
     }

@@ -3,6 +3,8 @@
 #include <rex/rex_app.h>
 #include <rex/system/flags.h>
 #include <rex/system/achievement_manager.h>
+#include <rex/input/device_assignment.h>
+#include <rex/input/input_system.h>
 #include "discord_rpc/discord_rpc.h"
 #include "mc_engine/threading.h"
 #include "mc_engine/logging.h"
@@ -22,14 +24,31 @@ REXCVAR_DECLARE(bool, mcla_native_gfx);
 REXCVAR_DECLARE(bool, mcla_native_gfx_own_device);
 REXCVAR_DECLARE(bool, mcla_native_gfx_own_swapchain);
 #endif
+#if defined(LARECOMP_HAS_GPU)
+#include "gpu/gpu.h"
+#endif
+
 #include "mc_engine/guest_profiler.h"
 #include "mc_engine/pause_menu.h"
+#include "mc_engine/online/identity/identity_store.h"
+#include "mc_engine/online/identity/identity_ui.h"
+#include "mc_engine/online/online_toast.h"
+#include "mc_engine/online/server_browser/browser_ui.h"
 #include "mc_engine/map_mouse.h"
+#include "mc_engine/audio_output.h"
 #include "mc_engine/string_table.h"
 #include "isoinstaller/larecomp_iso_installer.h"
 #include "saveporter/larecomp_save_porter.h"
+#include "profile/larecomp_profile_picker.h"
 #include "bootprogress/larecomp_boot_progress.h"
 #include "mc_engine/modloader/modloader.h"
+#include "mc_engine/wheel/wheel_input.h"
+#include "mc_engine/ui/imgui_theme.h"
+#include "mc_engine/ui/debug_overlay.h"
+#include "mc_engine/ui/controller_toast.h"
+#include "mc_engine/ui/settings.h"
+#include "mc_engine/ui/achievements.h"
+#include <rex/ui/keybinds.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -116,6 +135,7 @@ class LarecompApp : public rex::ReXApp {
         "readback_memexport_fast", "d3d12_pipeline_creation_threads",
         "d3d12_allow_variable_refresh_rate_and_tearing", "d3d12_tiled_shared_memory",
         "d3d12_submit_on_primary_buffer_end",
+        "graphics_backend", "vulkan_readback_resolve", "vulkan_submit_on_primary_buffer_end",
         "render_target_path_d3d12", "texture_cache_memory_limit_soft",
         "texture_cache_memory_limit_hard",
         "texture_cache_memory_limit_render_to_texture",
@@ -267,6 +287,10 @@ class LarecompApp : public rex::ReXApp {
     SetFlag("async_shader_compilation", "true");
     SetFlag("d3d12_bindless", "true");
     SetFlag("d3d12_readback_resolve", "false");
+    // Same switch for the Vulkan command processor (graphics_backend picks
+    // which one runs): off, and only opened around vinyls and photos
+    // (mc_engine/hooks/readback_window.cpp).
+    SetFlag("vulkan_readback_resolve", "false");
     SetFlag("readback_memexport_fast", "true");
 
     // BadassBaboon: Asynchronously submit D3D12 command lists as primary PM4 buffers finish.
@@ -292,6 +316,18 @@ class LarecompApp : public rex::ReXApp {
   }
 
   void OnPreSetup(rex::RuntimeConfig& config) override {
+    config.audio_factory = &mcla::audio::CreateAudioSystem;
+
+    // One player, any number of pads. The SDK hands each new device the next
+    // free user slot, so a pad that reconnects, a wheel, or the second device
+    // Steam Input and DS4Windows add lands on user 1+. Those users have no
+    // profile, and the game then reports nobody signed in and stops saving.
+    config.input_factory = [](bool tool_mode) -> std::unique_ptr<rex::system::IInputSystem> {
+      std::unique_ptr<rex::input::InputSystem> input = rex::input::CreateDefaultInputSystem(tool_mode);
+      if (input) input->SetDeviceAssignment(std::make_unique<rex::input::SharedAssignment>());
+      return input;
+    };
+
     // The one line that decides whether this process contains an emulated GPU
     // at all. ReXApp::SetupPresentation only calls LoadGpuPlugin when
     // gpu_plugin is non-empty, so leaving it empty means rexgpu-xenos is never
@@ -312,6 +348,10 @@ class LarecompApp : public rex::ReXApp {
     }
 
     SetFlag("d3d12_allow_variable_refresh_rate_and_tearing", "true");
+
+    // LARecomp draws its own MCLA controller toast (mc_engine/ui); the SDK's
+    // would stack a second, unstyled card next to it.
+    SetFlag("controller_toast_enable", "false");
   }
 
   // Detached mode's hook: with no graphics system, ReXApp asks the app for the
@@ -319,6 +359,11 @@ class LarecompApp : public rex::ReXApp {
   // SetupPresentation is forced by the order -- the base calls this from
   // inside SetupPresentation, before the override below gets to run.
   std::unique_ptr<rex::ui::ImmediateDrawer> OnCreateImmediateDrawer() override {
+#if defined(LARECOMP_HAS_GPU)
+    if (mcla::gpu::Enabled()) {
+      return mcla::gpu::CreateOverlayDrawer();
+    }
+#endif
 #if defined(_WIN32)
     if (mcla::native_gfx::nocp::WantNoCommandProcessor()) {
       return mcla::native_gfx::nocp::CreateImmediateDrawer();
@@ -357,10 +402,61 @@ class LarecompApp : public rex::ReXApp {
   NativeSwapChainResizeListener swapchain_resize_listener_;
 #endif
 
+  void OnConfigureFonts(ImFontAtlas* atlas) override {
+    mcla::ui::LoadMclaFonts(atlas);
+  }
+
+  void OnConfigureStyle(ImGuiStyle& imgui_style, rex::ui::Style& ui_style) override {
+    mcla::ui::ApplyMclaTheme(imgui_style, &ui_style);
+  }
+
   bool SetupPresentation() override {
     if (!rex::ReXApp::SetupPresentation()) {
       return false;
     }
+
+    if (imgui_drawer()) {
+      mcla::ui::ApplyMclaTheme(ImGui::GetStyle(), &imgui_drawer()->style());
+      // The SDK registered bind_debug_overlay first, and the first bind that
+      // matches a key wins, so a second bind on F3 never fired. Its callback
+      // is cleared instead, and the telemetry card gets a bind of its own (a
+      // cvar name can only be registered once), seeded with the old key.
+      const std::string telemetry_key = rex::cvar::GetFlagByName("bind_debug_overlay");
+      rex::ui::UnregisterBind("bind_debug_overlay");
+      rex::ui::RegisterBind("bind_mcla_telemetry", telemetry_key.empty() ? "F3" : telemetry_key,
+                            "Toggle the MCLA telemetry overlay",
+                            [this] { mcla::ui::ToggleDebugOverlay(imgui_drawer()); });
+      // The same swap for the SDK's settings overlay (see settings.h).
+      const std::string settings_key = rex::cvar::GetFlagByName("bind_settings");
+      rex::ui::UnregisterBind("bind_settings");
+      rex::ui::RegisterBind("bind_mcla_settings", settings_key.empty() ? "F4" : settings_key,
+                            "Toggle the MCLA settings panel", [this] {
+                              mcla::ui::ToggleSettings(imgui_drawer(), settings_config_path_);
+                            });
+      // And for the achievement list (see achievements.h). It needs the
+      // runtime, which does not exist before the save picker is done.
+      const std::string achievements_key = rex::cvar::GetFlagByName("bind_achievements");
+      rex::ui::UnregisterBind("bind_achievements");
+      rex::ui::RegisterBind(
+          "bind_mcla_achievements", achievements_key.empty() ? "F7" : achievements_key,
+          "Toggle the MCLA achievement list", [this] {
+            if (runtime() && runtime()->kernel_state()) {
+              mcla::ui::ToggleAchievements(imgui_drawer(), immediate_drawer(), runtime(),
+                                           &achievements());
+            }
+          });
+      mcla::ui::StartControllerToasts(imgui_drawer());
+    }
+
+#if defined(LARECOMP_HAS_GPU)
+    // mcla_gpu: the Plume renderer creates its own device and the only swap
+    // chain on this window, so none of the D3D12 presentation below may run.
+    // The base has already built the ImGui drawer on CreateOverlayDrawer's
+    // drawer; the renderer runs its passes from here on.
+    if (mcla::gpu::Enabled()) {
+      return mcla::gpu::Startup(window(), app_context(), imgui_drawer());
+    }
+#endif
 
 #if defined(_WIN32)
     if (REXCVAR_GET(mcla_native_gfx) || mcla::native_gfx::nocp::WantNoCommandProcessor()) {
@@ -391,10 +487,38 @@ class LarecompApp : public rex::ReXApp {
     return true;
   }
 
+  // The "ACHIEVEMENT UNLOCKED" toast as an MCLA panel (mc_engine/ui/
+  // achievements.h) in place of the SDK's fixed-size one.
+  std::unique_ptr<rex::ui::AchievementNotificationDialog> CreateAchievementNotificationDialog()
+      override {
+    return mcla::ui::MakeAchievementToast(imgui_drawer(), immediate_drawer(), runtime());
+  }
+
+  void OnWindowPixelSizeChanged(uint32_t pixel_width, uint32_t pixel_height) override {
+    rex::ReXApp::OnWindowPixelSizeChanged(pixel_width, pixel_height);
+#if defined(LARECOMP_HAS_GPU)
+    mcla::gpu::RequestResize();
+#endif
+  }
+
+  // A normal window close never reaches OnShutdown: ReXApp::OnClosing
+  // terminates the title and _Exit()s. This runs first, on the UI thread, so
+  // the Plume renderer stops its render thread, drains the GPU and gives the
+  // swap chain back before the process dies.
+  bool OnWindowCloseRequested() override {
+#if defined(LARECOMP_HAS_GPU)
+    mcla::gpu::Shutdown();
+#endif
+    return rex::ReXApp::OnWindowCloseRequested();
+  }
+
   void OnShutdown() override {
     // Closing the window while the boot content build runs: let it finish
     // writing the mod archive before the process goes, as it always did.
     larecomp::WaitForBootBuild();
+#if defined(LARECOMP_HAS_GPU)
+    mcla::gpu::Shutdown();
+#endif
 #if defined(_WIN32)
     mcla::native_gfx::NativeSwapChain::Instance().Shutdown();
     mcla::native_gfx::DeviceManager::Instance().Shutdown();
@@ -406,7 +530,23 @@ class LarecompApp : public rex::ReXApp {
     std::_Exit(0);
   }
 
+  // Whether the player has to pick a save is decided here: the base has just
+  // read larecomp.toml, and its own name prompt (which only knows how to ask for
+  // one text) has not yet looked at user_name.
+  bool SetupEnvironment() override {
+    if (!rex::ReXApp::SetupEnvironment()) {
+      return false;
+    }
+    larecomp::PrepareProfileChoice(user_data_root());
+    larecomp::identity::SetUserDataRoot(user_data_root());
+    // Before the window starts SDL's joystick layer: keeps known wheels out of the gamepad layer.
+    larecomp::wheel::EarlyInit();
+    return true;
+  }
+
   void OnConfigurePaths(rex::PathConfig& paths) override {
+    // The MCLA settings panel saves here, as the SDK's overlay does.
+    settings_config_path_ = paths.config_path;
     const auto root = ExeDir();
 
     // A bare default.xex is not enough to call a directory the game root: the
@@ -456,6 +596,12 @@ class LarecompApp : public rex::ReXApp {
       }
     }
 
+    const auto remembered = larecomp::RememberedGameInstall(paths.user_data_root);
+    if (!remembered.empty() && is_valid_game_root(remembered)) {
+      paths.game_data_root = remembered;
+      return;
+    }
+
     // BadassBaboon's Recomp Adjustments: walk up from the exe looking for the
     // game data, so a portable layout works without --game_data_root. Checked
     // at every level, nearest first: MCLA_Game_Files/, game/, assets/, then the
@@ -491,13 +637,34 @@ class LarecompApp : public rex::ReXApp {
   // Filled by OnConfigurePaths, which runs before logging exists.
   std::vector<std::string> path_notes_;
 
-  // First-launch wizards: install the game files from an ISO, then offer to
-  // import a save. Both are asynchronous -- rex::ReXApp lets this hook return
-  // std::nullopt and call `resume` later from the UI thread -- because a nested
-  // message loop never drains the SDL event queue the window lives on, and the
-  // stock SDK offers no way to pump it at all. While a wizard is up, the app's
-  // own loop keeps drawing it.
+  // The config file the settings panel saves to (ReXApp keeps its own private).
+  std::filesystem::path settings_config_path_;
+
+  // First-launch dialogs: which save to play, install the game files from an
+  // ISO, then offer to import a save. All asynchronous -- rex::ReXApp lets this
+  // hook return std::nullopt and call `resume` later from the UI thread --
+  // because a nested message loop never drains the SDL event queue the window
+  // lives on, and the stock SDK offers no way to pump it at all. While one is
+  // up, the app's own loop keeps drawing it.
   std::optional<rex::PathConfig> OnFinalizePaths(const rex::PathConfig& defaults, std::function<void(rex::PathConfig)> resume) override {
+    // The save comes first: the save check below and the content manager both
+    // key on the profile name it settles.
+    if (larecomp::ShowProfilePicker(imgui_drawer(), defaults, [this, defaults, resume]() {
+          // Called from the dialog's own draw: step out of it first.
+          app_context().CallInUIThreadDeferred([this, defaults, resume]() {
+            if (auto paths = FinalizePathsAfterProfile(defaults, resume)) {
+              resume(std::move(*paths));
+            }
+          });
+        })) {
+      return std::nullopt;
+    }
+    return FinalizePathsAfterProfile(defaults, resume);
+  }
+
+  // The ISO wizard, then the save offer: the paths when nothing is up, or
+  // std::nullopt when a wizard is and will call `resume` itself.
+  std::optional<rex::PathConfig> FinalizePathsAfterProfile(const rex::PathConfig& defaults, const std::function<void(rex::PathConfig)>& resume) {
     rex::PathConfig paths = defaults;
 
     if (!larecomp::IsGameInstalled(paths.game_data_root)) {
@@ -596,6 +763,10 @@ class LarecompApp : public rex::ReXApp {
       }
     }
 
+    // The online identity's XUID has to reach the profile before the guest
+    // first asks for it (the guest starts in LaunchModule).
+    larecomp::identity::ApplyProfileIdentity();
+
     auto* fd = rex::Runtime::instance()->function_dispatcher();
     uint8_t* base = rex::Runtime::instance()->virtual_membase();
     g_guest_mem = base;
@@ -691,7 +862,7 @@ class LarecompApp : public rex::ReXApp {
     LARECOMP_APP_INFO("by @mzzvxm. base memory: 0x{:016X}",
                       reinterpret_cast<std::uintptr_t>(g_guest_mem));
 
-    window()->SetTitle("LARecomp (60 FPS Enhanced)");
+    window()->SetTitle("LARecomp");
 
     // No window icon is set: the build ships no .ico, so the window keeps the
     // default one the window class provides.
@@ -730,6 +901,12 @@ class LarecompApp : public rex::ReXApp {
     LARECOMP_Discord_Init();
     mc::ui::InitGraphicsButtonPatch();
     InitPauseMenuHooks();
+    // UI thread (the build's completion is handed back here), as the dialog
+    // has to be created on it.
+    larecomp::StartOnlineToast(imgui_drawer(), immediate_drawer());
+    larecomp::StartServerBrowser(imgui_drawer(), immediate_drawer(),
+                                 runtime() ? runtime()->input_system() : nullptr);
+    larecomp::StartIdentity(imgui_drawer());
     InitMapMouse();
     InitStringTableTools();
     InitHooks();  // its own modloader::Init call is a no-op after the build

@@ -23073,6 +23073,7 @@ out_directory_path = "generated"
 0x8275CA40 = { name = "rex_sub_8275CA40", size = 0x60 }
 0x8275CAA0 = { name = "rex_sub_8275CAA0", size = 0x68 }
 0x8275CB08 = { name = "rex_sub_8275CB08", size = 0x64 }
+0x8275CB70 = { name = "rex_sub_8275CB70", size = 0x4 } # XamInputGetCapabilities thunk; hooked by wheel/wheel_fake.cpp
 0x8275CB78 = { name = "rex_sub_8275CB78", size = 0xC }
 0x8275CB88 = { name = "rex_sub_8275CB88", size = 0xC8 }
 0x8275CC50 = { name = "rex_sub_8275CC50", size = 0x3C }
@@ -25059,6 +25060,7 @@ address = 0x8263CB78
 name = "Hook_PhotoModeCapture"
 registers = ["r3"]
 
+
 [[midasm_hook]]
 address = 0x82233EB4
 name = "Patch_AspectRatio_82233EB4"
@@ -25170,6 +25172,44 @@ name = "Patch_DevOptionRegistered"
 registers = ["r3"]
 after_instruction = false
 
+# 0x822340F4: the `lwzx r3, r9, r31` in mcRearView::Draw (sub_82233E18) that loads the
+# frame mesh (rear_view_1bg) for its vtbl+32 draw at 0x82234104. True jumps to
+# 0x82234108, past the draw -- the frame is skipped and the mirror's scene viewport,
+# a separate phase, is untouched. See hooks/rear_view.cpp (rearview_frame).
+[[midasm_hook]]
+address = 0x822340F4
+name = "Patch_RearViewFrameSkip"
+jump_address_on_true = 0x82234108
+
+# 0x8236051C: the `bl __savegprlr_14` of mcCarModel's draw (sub_82360518), r4 = the
+# phase (the entry itself, 0x82360518, already carries Hook_SquashSelectVehicle and the
+# recompiler takes one hook per address). It knows the colour pass 0x10000 but not the
+# mirror's 0x1000000, for which it draws nothing; the hook passes it 0x10000 in the
+# mirror's phase so cars show up. rear_view.cpp.
+[[midasm_hook]]
+address = 0x8236051C
+name = "Patch_RearViewCarPhase"
+registers = ["r3", "r4"]
+after_instruction = false
+
+# 0x82308178: entry of the mirror phase's begin (sub_82308178). Diagnostic only
+# (rearview_diag): logs what each render client holds when the phase starts.
+[[midasm_hook]]
+address = 0x82308178
+name = "Patch_RearViewDiag"
+after_instruction = false
+
+# 0x8235F9EC: right after `bl sub_82175F20` in sub_8235F738 (a car's visibility prep), r3 =
+# the result. That query tests the car against the frustums kept for the main view and the
+# prep zeroes the car's visible word on the "outside"/"occluded" bits. During the mirror's own
+# run of the prep (rear_view.cpp) the hook clears those bits so only the current-camera
+# frustum test decides.
+[[midasm_hook]]
+address = 0x8235F9EC
+name = "Patch_RearViewCullBits"
+registers = ["r3"]
+after_instruction = false
+
 # 0x823126A4: `bl sub_8230D988` in the sun-cascade shadow phase of sub_823120C8.
 #
 # sub_8230D988 hunts for the next impostor to refresh with two nested loops that
@@ -25221,12 +25261,38 @@ name = "Hook_DumpJoinBlob"
 registers = ["r4"]
 after_instruction = false
 
+# Online ligado/desligado sem reiniciar (system_link.cpp). Os dois pontos ficam
+# logo depois das duas chamadas a XNetGetEthernetLinkStatus (sub_8244A680) em
+# sub_82500F98, o estado do hardware de rede: r3 = status do link. Um 0 no
+# primeiro (estado != 0) é o caminho de cabo desligado do próprio jogo, que
+# fecha todos os sockets; o segundo (estado 0) é o update antes de reabrir.
+[[midasm_hook]]
+address = 0x82500FC8
+name = "Hook_NetLinkWhileUp"
+registers = ["r3"]
+after_instruction = false
+
+[[midasm_hook]]
+address = 0x82500FEC
+name = "Hook_NetLinkWhileDown"
+registers = ["r3"]
+after_instruction = false
+
 # Discord RPC: cache the current district. r3 holds mc::LookupDistrict's return
 # right after the bl inside Racer_GetCurrentDistrict (sub_822ADEC0). Read-only.
 [[midasm_hook]]
 address = 0x822ADEE0
 name = "Hook_CaptureDistrict"
 registers = ["r3"]
+after_instruction = false
+
+# Steering wheel (wheel/wheel_input.cpp): the HUD update sub_822112A8 hands the current gear to the
+# "GearValue" swf variable. At the bl to sub_8223FF00, r4 = the gear (-1 reverse, 0 neutral, 1..N) and
+# r5 = the vehicle the HUD is showing. Read-only; feeds the H-shifter emulation.
+[[midasm_hook]]
+address = 0x822118D4
+name = "Hook_WheelHudGear"
+registers = ["r4", "r5"]
 after_instruction = false
 
 # Online Tournament: short-circuit the mcOnlineTournament state machine
@@ -25263,6 +25329,93 @@ address = 0x822BC658
 name = "Patch_BrainRacingResetNullGuard"
 registers = ["r3"]
 return_on_true = true
+after_instruction = false
+
+# Rate My Ride (src/mc_engine/online/rate_my_ride/). The mode talks to the dead
+# rage::rlUpload service through nine functions that queue a task; each hook sits
+# on the function's first instruction and, for the "RateMyRide" table only, sends
+# the request to our backend instead and returns r3 = 1 ("queued"). The reply is
+# written back at the top of mcRateMyRide's status poll (sub_826B2328), the way
+# the rlUpload worker would have filled the task outputs. r1 = caller stack for
+# the arguments past r10.
+[[midasm_hook]]
+address = 0x824F6DE8
+name = "Hook_RmrGetTableSize"
+registers = ["r3", "r4", "r5", "r6", "r7", "r8"]
+return_on_true = true
+after_instruction = false
+
+[[midasm_hook]]
+address = 0x824F6EA0
+name = "Hook_RmrReadByGamer"
+registers = ["r3", "r4", "r5", "r6", "r7", "r8", "r9"]
+return_on_true = true
+after_instruction = false
+
+[[midasm_hook]]
+address = 0x824F6FA0
+name = "Hook_RmrReadRandom"
+registers = ["r1", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"]
+return_on_true = true
+after_instruction = false
+
+[[midasm_hook]]
+address = 0x824F70A8
+name = "Hook_RmrReadByRank"
+registers = ["r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"]
+return_on_true = true
+after_instruction = false
+
+[[midasm_hook]]
+address = 0x824F7188
+name = "Hook_RmrRateRecord"
+registers = ["r3", "r4", "r5", "r6", "r7", "r8"]
+return_on_true = true
+after_instruction = false
+
+[[midasm_hook]]
+address = 0x824F7308
+name = "Hook_RmrUploadFile"
+registers = ["r1", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"]
+return_on_true = true
+after_instruction = false
+
+[[midasm_hook]]
+address = 0x824F7468
+name = "Hook_RmrOverwriteFile"
+registers = ["r1", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"]
+return_on_true = true
+after_instruction = false
+
+[[midasm_hook]]
+address = 0x824F7578
+name = "Hook_RmrDownloadFile"
+registers = ["r3", "r4", "r5", "r6", "r7", "r8", "r9"]
+return_on_true = true
+after_instruction = false
+
+[[midasm_hook]]
+address = 0x824F7638
+name = "Hook_RmrOverwriteUserData"
+registers = ["r3", "r4", "r5", "r6", "r7", "r8", "r9"]
+return_on_true = true
+after_instruction = false
+
+# Rate My Ride reply pump: mcRateMyRide's per-frame status poll. Applying the
+# replies here (and not when they arrive) keeps them after the code that queued
+# the task, which RefreshCurrentRecord depends on. r3 = the mcRateMyRide object.
+[[midasm_hook]]
+address = 0x826B2328
+name = "Hook_RmrPump"
+registers = ["r3"]
+after_instruction = false
+
+# Rate My Ride entry ("[rmr] Entering Rate My Ride", sub_826B15B8): replies
+# still in flight from a previous visit are dropped.
+[[midasm_hook]]
+address = 0x826B15B8
+name = "Hook_RmrEnter"
+registers = ["r3"]
 after_instruction = false
 
 # [invite-probe] Log online session net-event ids (guest sub_8226D8F8). The
@@ -25665,6 +25818,28 @@ name = "Hook_MenuKeyDispatch"
 registers = ["r31", "r28", "r27"]
 jump_address_on_true = 0x82630A98
 
+# SYSTEM LINK > ONLINE (pause_menu.cpp). A janela SYSTEM LINK não é lista: é o
+# UIMenu "LAN" desenhado pelo FlashNavigator no filme popup.xsf, e sub_82220308
+# escreve um elemento por filho (text1, property1, count, select; nunca type).
+# 0x8222064C = logo depois do elemento de um filho ficar pronto (passou o select
+# de 0x82220638 e os atributos fs_ de sub_8221EF60). r27 = menu, r28 = elemento,
+# r30 = filho. O do ONLINE ganha type 4 (checkbox do Fillmenu) e select 0/1.
+[[midasm_hook]]
+address = 0x8222064C
+name = "Hook_LanFillElement"
+registers = ["r27", "r28", "r30"]
+after_instruction = false
+
+# A no SYSTEM LINK: sub_8263B9A0 (tratador de eventos do UIMenu, vtable
+# 0x82020654 +0x124), já sabendo que o evento vem da entrada de menu. r30 =
+# menu, r28 = evento (código 52 = A). true sai por loc_8263BBC0 (li r3, 1:
+# tratado) com o quadro já montado.
+[[midasm_hook]]
+address = 0x8263B9F0
+name = "Hook_LanAccept"
+registers = ["r30", "r28"]
+jump_address_on_true = 0x8263BBC0
+
 # LZX streaming decompression probe (lzx_stats cvar). Brackets the
 # XMemDecompressStream call (bl sub_8244FF20 at 0x821D5EB8) inside
 # zlibInflater::InflateBegin (sub_821D5E10), which runs on the two
@@ -25941,19 +26116,19 @@ name = "MCLAChassisPushbackAccel"
 address = 0x82563850
 registers = ["f1"]
 
-# BadassBaboon's Recomp Adjustments: Vehicle chassis angular velocity continuous-time smoothing
-# 0x8236895C: loc_8236895C in sub_823688B8 (car physics solver).
-# f13 is the chassis angular velocity filter coefficient alpha (0.80 at 30 FPS, 0.40 at >= 60 FPS).
+# Motorcycle gyro, continuous-time filters. sub_823688B8 is mcBikeGyro::Update,
+# slot 2 of the vtable at 0x820488C0; cars run mcCarGyro::Update instead.
+# 0x8236895C: where the <60 / >=60 FPS paths rejoin; f13 = smoothed-position
+# lerp factor (0.40 from 0x827E6740, x2.0 from 0x82040E94 below 60 FPS).
 [[midasm_hook]]
-name = "MCLACarAngularVelocitySmoothing"
+name = "MCLABikeGyroPositionFilter"
 address = 0x8236895C
 registers = ["f13"]
 
-# BadassBaboon's Recomp Adjustments: Vehicle chassis angular acceleration / rotational G-forces continuous-time smoothing
-# 0x823689F0: loc_823689F0 in sub_823688B8 (car physics solver).
-# f0 is the chassis angular acceleration filter coefficient alpha (0.30 at 30 FPS, 0.15 at >= 60 FPS).
+# 0x823689F0: same join for the smoothed-velocity factor (0.15 from
+# 0x827E6744, x2.0 below 60 FPS); f0 = factor.
 [[midasm_hook]]
-name = "MCLACarAngularAccelerationSmoothing"
+name = "MCLABikeGyroVelocityFilter"
 address = 0x823689F0
 registers = ["f0"]
 
@@ -26014,6 +26189,18 @@ name = "MCLA_CustomMusic_StartSong"
 address = 0x821EFB5C
 registers = ["r31"]
 jump_address_on_true = 0x821EFB78
+
+# The cue starter reaches one of these two calls according to the selected
+# voice slot. r4 is the cue hash, r6 the play parameters (+0: dB offset).
+[[midasm_hook]]
+name = "MCLA_CustomMusic_CueGain"
+address = 0x821F505C
+registers = ["r4", "r6"]
+
+[[midasm_hook]]
+name = "MCLA_CustomMusic_CueGain"
+address = 0x821F50EC
+registers = ["r4", "r6"]
 
 # 0x821F0600: mcMusicManager::GotoSong(this, index), entry. r3 is the manager.
 # Every song change goes through here, so it is where the "no cue" flag at
@@ -26108,7 +26295,7 @@ registers = ["r3"]
 # *(root + 0x80) as the composite's child array with no type check, so on a geometry
 # it picks up m_Vertices and the deform pass faults in sub_8259FF88. These three
 # sites are every place that does it; they substitute the root when it is not a
-# composite, and are a no-op for stock player cars. See hooks.cpp.
+# composite, and are a no-op for stock player cars. See hooks/vehicle.cpp.
 
 # 0x8232D048 in sub_8232CFF0, before `addi r6, r11, 0x10`. r9 = root + 0x80.
 [[midasm_hook]]
@@ -26684,3 +26871,175 @@ address = 0x8271F3B0
 name = "MCLACameraTransitionComplete"
 registers = ["r3"]
 
+# Online race start, prop owners (src/mc_engine/online/race_props.cpp).
+# A fragInst keeps the owner the prop manager made for it at +0x8C (32 bytes,
+# vtable 0x820CC6C0, +16 = the inst). Starting an online race resets the world
+# and re-syncs every race prop through the per-update owner functor
+# (sim+0x34C, fn sim+0x358 = sub_82728BB8); with mods installed one owner holds
+# garbage at +16 and the read at +68 crashes the Release build.
+#   0x82728A30  sub_827289E8 built an owner: r3 = owner, r31 = inst
+#   0x82728A98  sub_82728A68 frees an owner: r31 = owner, r1 = frame
+#   0x8248CE88  sub_8248CE08, mtctr before the owner functor: r31 = inst,
+#               r4 = owner; true skips the call (0x8248CE90)
+#   0x8248C31C  sub_8248C228, same functor at its tail; true skips (0x8248C324)
+[[midasm_hook]]
+address = 0x82728A30
+name = "Hook_PropOwnerCreated"
+registers = ["r3", "r31"]
+after_instruction = false
+
+[[midasm_hook]]
+address = 0x82728A98
+name = "Hook_PropOwnerFreed"
+registers = ["r31", "r1"]
+after_instruction = false
+
+[[midasm_hook]]
+address = 0x8248CE88
+name = "Patch_PropOwnerSyncGuard"
+registers = ["r31", "r4"]
+jump_address_on_true = 0x8248CE90
+
+[[midasm_hook]]
+address = 0x8248C31C
+name = "Patch_PropOwnerPoseGuard"
+registers = ["r31", "r4"]
+jump_address_on_true = 0x8248C324
+
+# XSessionCreate's guest wrapper sub_8274B440 (every online session, System Link
+# and LIVE, host and joiner) stores XAM's session object into the request at
+# 0x8274B584 (`stw r11, buffer+0`). XAM's object is a placeholder (0xDEADF00D)
+# and the 0xB0010 handler writes 0xDEADF00D at that address, which lands in the
+# game's heap through another view of the same physical page (0xBEADF00D).
+# Hook_SessionCreateObject (online/xbox_live.cpp) sends 0 instead.
+[[midasm_hook]]
+address = 0x8274B584
+name = "Hook_SessionCreateObject"
+registers = ["r11"]
+after_instruction = false
+
+# Leaderboards (online/leaderboards/leaderboards.cpp). sub_8252C658 flushes a
+# gamer's queued leaderboard updates at the end of a LIVE session through
+# XSessionWriteStats; at the `bl sub_8274BDA0` r25 = the gamer's session record
+# (gamer id at +8), r5 = view count, r6 = XSESSION_VIEW_PROPERTIES[]. Read-only:
+# the local player's own views go to the leaderboard backend.
+[[midasm_hook]]
+address = 0x8252C828
+name = "Hook_LeaderboardWrite"
+registers = ["r25", "r5", "r6"]
+after_instruction = false
+
+# UI theme (hooks/ui_theme.cpp). The five places the game's Flash player
+# (swfTEXT, swfEDITTEXT, swfSHAPE fill/line) publish the final ARGB vertex color
+# of whatever it draws next: `stw r11, dword_828396F4@l(rX)`. The hook runs
+# BEFORE the store, so editing r11 recolors the draw. r11 = 0xAARRGGBB.
+[[midasm_hook]]
+address = 0x82603E18
+name = "Hook_UiColor_TextInit"
+registers = ["r11"]
+
+[[midasm_hook]]
+address = 0x82604020
+name = "Hook_UiColor_TextRun"
+registers = ["r11"]
+
+[[midasm_hook]]
+address = 0x8260474C
+name = "Hook_UiColor_Edit"
+registers = ["r11"]
+
+[[midasm_hook]]
+address = 0x82607C88
+name = "Hook_UiColor_Fill"
+registers = ["r11"]
+
+[[midasm_hook]]
+address = 0x82607E28
+name = "Hook_UiColor_Line"
+registers = ["r11"]
+
+# Native keyboard (src/mc_engine/keyboard_native.cpp). The poll sub_82614C70 asks
+# XamInputGetKeystrokeEx for key events, which the SDK refuses, so the game's key
+# table (byte_82905738 -> byte_82905538, read by ioMapper type 0 / 14) is always
+# empty. This hook sits where every path out of the poll converges, just before the
+# table is published, and writes the host keyboard into it.
+[[midasm_hook]]
+address = 0x82614CFC
+name = "Hook_KeyboardFeed"
+
+# sub_822A4DE8 clears the player's mapper and refills it from the control map
+# (xenon_controls*.map); at its return r30 is the controller struct, and the
+# keyboard entries go on the end of the list.
+[[midasm_hook]]
+address = 0x822A4EB4
+name = "Hook_ControlMapRebuilt"
+registers = ["r30"]
+
+# The pad struct's bits are final here (r31 = pad). Title/sign-in screens read them
+# directly, not through the UI mapper, so until the game is entered the menu keys are
+# added to pad 0's bits (keyboard_native.cpp).
+[[midasm_hook]]
+address = 0x82615048
+name = "Hook_PadBitsFinalize"
+registers = ["r31"]
+
+# Options > Controller > Customize: the "press a button" capture (sub_82727010) only looks at
+# the raw pad, so with a keyboard it never finishes and swallows every key. After its
+# prologue (r28 = out type ptr, r24 = out value ptr), a key that just went down answers it:
+# type 0 (keyboard), value r11, then the function's own tail `stw r11,0(r24); li r3,1; ret`.
+[[midasm_hook]]
+address = 0x82727044
+name = "Hook_ControlCaptureKey"
+registers = ["r11", "r28"]
+jump_address_on_true = 0x8272737C
+
+# Custom Controls row label (sub_82679678(type, value, &isIcon), a leaf with no prologue). A
+# keyboard binding (type 0) came back empty; the hook answers with a key cap iconID or the
+# name of the key and returns through the own blr of the function.
+[[midasm_hook]]
+address = 0x82679678
+name = "Hook_ControlLabel"
+registers = ["r3", "r4", "r5"]
+jump_address_on_true = 0x82679BD4
+
+
+# Server browser (src/mc_engine/online/server_browser).
+# System Link search answer about to be kept (r27 = 1); r1+0x58 = sender vip.
+[[midasm_hook]]
+address = 0x824FD3A0
+name = "Hook_BrowserLanResult"
+registers = ["r1", "r27"]
+
+# Live search result past its first check (r3); r30 = XSESSION_SEARCHRESULT.
+[[midasm_hook]]
+address = 0x824FC8D0
+name = "Hook_BrowserLiveResult"
+registers = ["r30", "r3"]
+
+# CreateGame while a picked room is being joined: leave through its own
+# failure exit (posts net.error, returns 0) instead of hosting.
+[[midasm_hook]]
+address = 0x8226BB2C
+name = "Hook_BrowserCreateGameVeto"
+registers = ["r27"]
+jump_address_on_true = 0x8226BCCC
+
+# JoinSession: the picked room was found and the game joins it.
+[[midasm_hook]]
+address = 0x8226BCF0
+name = "Hook_BrowserJoinSession"
+registers = ["r3"]
+
+
+# Big sessions (src/mc_engine/online/session_limits.cpp): the "MaxPlayers > 8" tests of
+# CreateGame (flag at netMgr+756) and of the session defaults (jumptable case 3).
+# r11 is zeroed before use when net_lift_big_session_limits is on.
+[[midasm_hook]]
+address = 0x8226BBE4
+name = "Hook_NetBigSessionFlag"
+registers = ["r11"]
+
+[[midasm_hook]]
+address = 0x8228A0F0
+name = "Hook_NetBigSessionDefault"
+registers = ["r11"]

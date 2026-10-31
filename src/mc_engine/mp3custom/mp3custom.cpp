@@ -6,6 +6,7 @@
 #include "../logging.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -57,6 +58,12 @@ REXCVAR_DEFINE_DOUBLE(custom_music_volume, 0.5, "MCLA/Audio",
     "Trim applied on top of the in-game music slider for custom MP3 tracks. "
     "The shipped radio goes through the RAGE mixer and its ducking curves, "
     "which the host player does not, so 1.0 comes out noticeably louder.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_DOUBLE(custom_music_cue_gain_db, 4.0, "MCLA/Audio",
+    "Gain for native custom music in the game's audio mixer, after the bank's "
+    "3 dB MP3 decode headroom. Shipped songs keep their original gain.")
+    .range(0.0, 6.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(music_bank_log, false, "MCLA/Audio",
@@ -139,11 +146,15 @@ constexpr size_t kNotifyMax            = 96;
 //   +52          current genre
 //   +68          current song entry
 //   +88 + 8*g    atArray<songEntry*> for genre g: ptr, u16 count, u16 capacity
+//   +160 + 24*g  shuffle table of station g (0..8); +4 is its int32 song count
 constexpr uint32_t kMgrVolume      = 32;
 constexpr uint32_t kMgrSongIndex   = 48;
 constexpr uint32_t kMgrGenre       = 52;
 constexpr uint32_t kMgrCurrentSong = 68;
 constexpr uint32_t kMgrGenreArrays = 88;
+constexpr uint32_t kMgrShuffles    = 160;
+constexpr uint32_t kShuffleStride  = 24;
+constexpr uint32_t kShuffleCount   = 4;
 
 // +24 is the "the RAGE music path is not the one playing" flag. The per-frame
 // update callback sub_821F0838 bails out early on it:
@@ -163,6 +174,12 @@ constexpr uint32_t kMgrNoCue = 24;
 // MUSIC_GENRE_* order comes from the name table at off_827DA540.
 constexpr uint32_t kGenreAll       = 7;  // MUSIC_GENRE_ALL
 constexpr uint32_t kGenreOnTheFly  = 8;  // MUSIC_GENRE_ON_THE_FLY -> "Custom Playlists"
+constexpr uint32_t kStationCount   = 9;  // the seven genres, ALL, ON_THE_FLY
+
+constexpr const char* kStationNames[kStationCount] = {
+    "ECLECTIC", "ELECTRONIC", "HARDROCK", "HIPHOP",     "ROCK",
+    "TECHNO",   "WEST_RAP",   "ALL",      "ON_THE_FLY",
+};
 
 // Song entry, built by mcMusicManager::AddSong (sub_821EF310):
 //   [0] music game object   [1] hash code   [2] char* display name
@@ -258,6 +275,12 @@ float ReadGuestBEFloat(uint32_t ea) {
     float    out;
     std::memcpy(&out, &bits, sizeof(out));
     return out;
+}
+
+void WriteGuestBEFloat(uint32_t ea, float value) {
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    WriteGuestBE32(ea, bits);
 }
 
 uint32_t CallGuest1(uint32_t fn_addr, uint32_t a0) {
@@ -535,16 +558,10 @@ void DumpRadio(uint32_t mgr) {
     if (done || !REXCVAR_GET(music_list) || !IsGuestPtr(mgr)) return;
     done = true;
 
-    // Order comes from the name table at off_827DA540.
-    static const char* const kGenreNames[] = {
-        "ECLECTIC", "ELECTRONIC", "HARDROCK", "HIPHOP",
-        "ROCK",     "TECHNO",     "WEST_RAP", "ALL",
-    };
-
     for (uint32_t g = 0; g < 8; ++g) {
         const uint32_t arr   = ReadGuestBE32(GenreArray(mgr, g));
         const uint16_t count = ReadGuestBE16(GenreArray(mgr, g) + 4);
-        MC_INFO("[radio] genre {} {}: {} song(s)", g, kGenreNames[g], count);
+        MC_INFO("[radio] genre {} {}: {} song(s)", g, kStationNames[g], count);
         if (!IsGuestPtr(arr)) continue;
         for (uint16_t i = 0; i < count; ++i) {
             const uint32_t entry = ReadGuestBE32(arr + 4u * i);
@@ -854,6 +871,21 @@ bool MCLA_CustomMusic_StartSong(PPCRegister& r31) {
     return true;
 }
 
+// The game's cue starter calls sub_82549078 at either 0x821F505C or
+// 0x821F50EC. r4 is the cue hash and r6 points at its play parameters;
+// parameter +0 is the dB offset sent to sub_82148CB0. Raise only cues that
+// music::Build installed, so the shipped radio and other sounds keep their gain.
+void MCLA_CustomMusic_CueGain(PPCRegister& r4, PPCRegister& r6) {
+    if (!mc::music::IsCustomCue(static_cast<uint32_t>(r4.u32))) return;
+    const uint32_t params = static_cast<uint32_t>(r6.u32);
+    if (params < 0x1000u || params > 0xFFFFFFFBu) return;
+    const float gain = static_cast<float>(REXCVAR_GET(custom_music_cue_gain_db));
+    if (!(gain > 0.0f)) return;
+    const float original = ReadGuestBEFloat(params);
+    if (!std::isfinite(original)) return;
+    WriteGuestBEFloat(params, original + gain);
+}
+
 // 0x82146030, the store of the file handle in audStreamingWaveSlot::RequestLoad
 // (sub_82145F28). r3 is the handle, -1 when the open failed; r31 is the slot,
 // and its +0x42 carries the bank id the request was made with. The id is the
@@ -932,6 +964,90 @@ void MCLA_CustomMusic_SelectSong(PPCRegister& r3) {
     if (IsGuestPtr(mgr)) WriteGuestBE32(mgr + kMgrNoCue, 0);
 }
 
+// ── The station a save asks for ───────────────────────────────────────
+//
+// sub_826402C0 hands the profile's radio settings to mcMusicManager when a save
+// is applied. They live in sub_82387B90() = 0x8288E920, which is the LocalOptions
+// block of mc4.sav byte for byte:
+//
+//     +0x3DFC8   u32[32]  Custom Playlists, as song hash codes
+//     +0x530     u32      the station (MUSIC_GENRE_*)
+//     +0x52D     u8       shuffle
+//
+//     each playlist hash:  sub_821EF690(mgr, hash)    skips a hash this radio
+//                                                     does not have
+//     sub_821EEC68(mgr, station)                      SetGenre
+//     sub_821EEA90(mgr, shuffle)                      reads the first shuffled
+//                                                     song of mgr+52's station
+//
+// SetGenre Quitf's when the station has no songs ("This genre: %i has an empty
+// size: %i") or is not 0..8. On the 360 the song set never changed, so a saved
+// playlist always resolved. Here it does change: a save made on a machine with
+// other custom music, one from the retired host player (its ids were
+// 0xC0DE0000 + i), one with DLC songs this install lacks, or a track whose genre
+// was changed in manifest.txt (the genre is part of the track's name, and so of
+// its hash). Custom Playlists with none of its songs present is empty, and the
+// game dies applying the save -- the crash a shared save hits.
+//
+// So the radio plays the station a new profile starts on instead -- ALL, which
+// sub_8238C120 writes into +0x530 for a fresh profile -- or any station with
+// songs if even ALL has none. Only the radio's state changes. The save keeps its
+// station and its playlist: +0x3DFC8 and +0x530 are written back only by
+// sub_826410D8, when the player leaves the radio menu having changed something,
+// so a save that passes through a machine without those songs still carries
+// them.
+//
+// The swap has to happen before SetGenre runs; skipping only its Quitf would
+// leave the empty station in mgr+52 for sub_821EEA90 to dereference. A bad index
+// is handled the same way, since the save loader checks nothing in a block but
+// its version byte and its size.
+
+REX_EXTERN(__imp__rex_sub_821EEC68);  // mcMusicManager::SetGenre(this, station)
+
+namespace {
+
+int32_t StationSongs(uint32_t mgr, uint32_t station) {
+    return static_cast<int32_t>(
+        ReadGuestBE32(mgr + kMgrShuffles + kShuffleStride * station + kShuffleCount));
+}
+
+// kStationCount when no station has a song at all.
+uint32_t PlayableStation(uint32_t mgr) {
+    if (StationSongs(mgr, kGenreAll) > 0) return kGenreAll;
+    for (uint32_t g = 0; g < kStationCount; ++g)
+        if (StationSongs(mgr, g) > 0) return g;
+    return kStationCount;
+}
+
+}  // namespace
+
+extern "C" REX_FUNC(rex_sub_821EEC68) {
+    const uint32_t mgr     = ctx.r3.u32;
+    const int32_t  station = static_cast<int32_t>(ctx.r4.u32);
+    if (!IsGuestPtr(mgr)) {
+        __imp__rex_sub_821EEC68(ctx, base);
+        return;
+    }
+
+    const bool    valid = station >= 0 && station < int32_t(kStationCount);
+    const int32_t songs = valid ? StationSongs(mgr, uint32_t(station)) : 0;
+    if (songs > 0) {
+        MC_INFO("[radio] station {}: {} song(s)", kStationNames[station], songs);
+    } else if (const uint32_t stand_in = PlayableStation(mgr); stand_in < kStationCount) {
+        if (valid)
+            MC_WARN("[radio] station {} has no songs on this machine (a save made with other "
+                    "music?) -- playing {} instead; the save keeps its own setting",
+                    kStationNames[station], kStationNames[stand_in]);
+        else
+            MC_WARN("[radio] station index {} is not a station -- playing {} instead", station,
+                    kStationNames[stand_in]);
+        ctx.r4.u64 = stand_in;
+    }
+    // With no song on any station the game's own Quitf stands: there is no
+    // radio left to fall back to.
+    __imp__rex_sub_821EEC68(ctx, base);
+}
+
 #else  // REXGLUE_HAS_XEO3_TARGET
 
 #include <rex/ppc/context.h>
@@ -940,6 +1056,7 @@ void InitCustomMusic() {}
 void TickCustomMusic() {}
 void MCLA_CustomMusic_Install(PPCRegister&) {}
 bool MCLA_CustomMusic_StartSong(PPCRegister&) { return false; }
+void MCLA_CustomMusic_CueGain(PPCRegister&, PPCRegister&) {}
 void MCLA_CustomMusic_SelectSong(PPCRegister&) {}
 void MCLA_CustomMusic_Announce(PPCRegister&) {}
 void MCLA_CustomMusic_Stop(PPCRegister&) {}

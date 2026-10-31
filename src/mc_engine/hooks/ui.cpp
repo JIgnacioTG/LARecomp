@@ -49,8 +49,11 @@ REXCVAR_DEFINE_STRING(button_prompts, "xbox", "MCLA/UI",
     "the game's own UI movies and texture dictionary, so this only flips the "
     "'platform' flag their ActionScript reads - no asset is swapped or reloaded. "
     "Menus already on screen keep their old glyphs until reopened, and the boot "
-    "legal screen switches to its PS3 text page.")
-    .allowed({"xbox", "playstation"})
+    "legal screen switches to its PS3 text page.\n"
+    "keyboard = key caps. The movies have no third glyph strip, so this stays on "
+    "platform 0 and keyboard_native.cpp paints a key cap over the pixels of the "
+    "Xbox A/B/X/Y/LB/RB/LT/RT bitmaps (the key bound to that menu button, kb_ui_*).")
+    .allowed({"xbox", "playstation", "keyboard"})
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_STRING(language, "auto", "MCLA/Localization",
@@ -123,7 +126,8 @@ void MCLA_SkipIntroRenderPassMask(PPCRegister& r4) {
     }
 }
 
-// Intro/legals pacing - deliberately NOT patched here.
+// Intro/legals pacing is not patched here: see HoldUntimedSwap in
+// frame_timing.cpp.
 //
 // The previous Hook_IntroHalfRate skipped every other SWF advance, which is
 // only correct at exactly 60 FPS. With a configurable fps_limit (30 / 60 / 120 /
@@ -131,10 +135,10 @@ void MCLA_SkipIntroRenderPassMask(PPCRegister& r4) {
 // fast, at 30 it runs at half speed. It was removed from the midnightclub fork
 // for the same reason and is not being reintroduced.
 //
-// Playback pacing above 30 FPS is inherent to unlocking the engine's 30 Hz
-// design point. Verified in midnightclub by testing hard caps at 30, 45 and 60:
-// the movie speed is identical at all three, so it is not tied to present rate
-// and no frame-rate-based correction can fix it. Supported answer is skip_intro.
+// Hard caps at 30, 45 and 60 gave the same intro speed in midnightclub because
+// the legals/logo loop never runs the engine timer (sub_821BDA90), where the
+// frame limiter lives: the cap never reached those frames at all. They are
+// paced at the swap instead.
 
 // 0x82725100, in sub_827250A8's per-movie lighting pass. The game asks the movie
 // for its "lights" node and then uses the answer without checking it:
@@ -534,7 +538,9 @@ void ReportPacing(const uint8_t* base, int64_t now) {
 // counting on the movie having stepped -- and so hidden itself -- in every one of
 // them. Held to 30 steps a second the movie could still be on screen when the grab
 // comes at a few hundred FPS, so for that tenth of a second it steps every update as
-// it always did.
+// it always did. The same for a tenth of a second after a discarded photo brings the
+// city back (PhotoCityReturning): the step that hides the full-screen photo must not
+// wait for the next 30 Hz period while the city overwrites the photo's memory.
 extern "C" REX_FUNC(rex_sub_82720898) {
     const uint32_t entry = ctx.r3.u32;
     uint32_t held = 0;
@@ -542,7 +548,7 @@ extern "C" REX_FUNC(rex_sub_82720898) {
         std::lock_guard<std::mutex> lock(g_pacing_mutex);
         if (PacedMovie* m = PacingFor(base, entry)) {
             const int64_t now = SteadyNowNs();
-            if (PhotoCaptureInProgress(base)) {
+            if (PhotoCaptureInProgress(base) || PhotoCityReturning()) {
                 m->next_due_ns = 0;  // back on the 30 Hz schedule from the next update
                 ++m->advanced;
             } else if (AdvanceDue(*m, now)) {

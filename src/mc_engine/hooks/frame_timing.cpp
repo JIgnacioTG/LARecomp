@@ -54,6 +54,25 @@ REXCVAR_DEFINE_BOOL(vsync_fast_poll, true, "MCLA/Performance",
     "fast poll keeps the GPU VSync worker spinning a whole core. Off restores the 1 ms sleep.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(intro_original_speed, true, "MCLA/Patches",
+    "Present the start-up legal screens and logos 30 times a second, as the console does. "
+    "They are drawn by a loop that never runs the engine timer, so fps_limit never reached "
+    "them and they played as fast as the host could present.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// Where the frame limiter waits. The game updates on its main loop
+// (sub_82131508) and presents from "[MC] Render Thread" (sub_82306238), one
+// frame behind. Waiting before the update leaves the present wherever the
+// render work ends it, so frames reach the screen at uneven intervals; waiting
+// just before the swap presents them evenly, and the queue between the two
+// threads holds the update back to the same interval. The cost is latency: the
+// update then runs up to a frame ahead of what is on screen.
+REXCVAR_DEFINE_BOOL(pace_at_swap, true, "MCLA/Performance",
+    "Hold each frame to the FPS limit right before it is presented instead of before the "
+    "game's update: even present intervals (best on a variable refresh display), at the cost "
+    "of up to one more frame of input latency.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(fence_spin_throttle, true, "MCLA/Performance",
     "Yield the host CPU inside the guest's D3D fence poll (sub_82412F98) instead of running "
     "its 32 pipeline-throttle NOPs. Off restores the stock guest spin.")
@@ -120,11 +139,63 @@ bool Patch_FenceSpinThrottle() {
     return true;
 }
 
+// Set by every pass through the engine timer (sub_821BDA90, MCLAFrameDelta),
+// taken by every swap.
+static std::atomic<bool> g_timer_since_swap{false};
+
+// Swaps the engine timer never saw. The legal screens and logos are drawn by a
+// loop of their own (the timer's only callers are sub_822611B0 and
+// sub_822C1FA8, the game loop), paced on the console by the swap interval of
+// two vblanks alone, which the runtime does not honour. Such swaps are held to
+// 30 a second -- from the second one in a row only: uncapped, the update and
+// present threads drift, and about one swap in forty finds no timer pass before
+// it while the next finds two; holding that lone swap would stutter play.
+// Swap thread only. `timed`: the engine timer ran since the previous swap.
+static void HoldUntimedSwap(bool timed) {
+    using Clock = std::chrono::steady_clock;
+    constexpr auto kPeriod = std::chrono::microseconds(1000000 / 30);
+    static Clock::time_point last_swap{};
+    static bool last_untimed = false;
+
+    const bool untimed = !timed;
+    if (untimed && last_untimed && REXCVAR_GET(intro_original_speed) &&
+        last_swap != Clock::time_point{}) {
+        const Clock::time_point due = last_swap + kPeriod;
+        // Sleep to a millisecond short of it, then yield the rest away: the
+        // sleep alone overshoots by up to a timer tick.
+        if (due - Clock::now() > std::chrono::microseconds(1500)) {
+            std::this_thread::sleep_until(due - std::chrono::milliseconds(1));
+        }
+        while (Clock::now() < due) {
+#if defined(_WIN32)
+            YieldProcessor();
+#else
+            std::this_thread::yield();
+#endif
+        }
+    }
+    last_untimed = untimed;
+    last_swap = Clock::now();
+}
+
 // Swap-interval patch at 0x82419AA0 ("li r11, 2"): the game always requests
 // D3D interval TWO (30 FPS); replacing with 1 requests 60 Hz. Note the current
 // RexGlue command processor ignores the guest swap interval (host vblank is a
 // fixed 60 Hz timer), so this is kept only for correctness of the swap packet.
+// It runs once per swap (sub_824199B0), which makes it where the swaps the
+// engine timer never saw are paced, and, with pace_at_swap, the game's frames.
+static void EnforceFrameLimit();
 bool Patch_60FPS_Byte(PPCRegister& r11) {
+    const bool timed = g_timer_since_swap.exchange(false, std::memory_order_relaxed);
+    if (timed && REXCVAR_GET(pace_at_swap)) {
+        // A game frame: held to the FPS limit here instead of before its update.
+        // Bound to the first thread that presents one, the render thread.
+        static const std::thread::id owner = std::this_thread::get_id();
+        if (std::this_thread::get_id() == owner) {
+            EnforceFrameLimit();
+        }
+    }
+    HoldUntimedSwap(timed);
     if (REXCVAR_GET(real_frame_delta)) {
         r11.u64 = 1; // Replaces the original value with 1 (li r11, 1)
         return true; // Skips the original instruction
@@ -159,9 +230,8 @@ static void EnforceFrameLimit() {
 
     const double period_us = 1000000.0 / static_cast<double>(limit);
 
-    // sub_821BDA90 has multiple callers across threads; bind limiter to main thread
-    static const std::thread::id owner = std::this_thread::get_id();
-    if (std::this_thread::get_id() != owner) return;
+    // One thread per call site: the callers bind to theirs (MCLAFrameDelta,
+    // PaceAtSwap), so the deadline is only ever advanced from one place at a time.
 
     auto now_us = [] {
         return static_cast<uint64_t>(
@@ -262,7 +332,14 @@ void MCLAFrameDelta(PPCRegister& r8) {
     // also silently disabled the FPS LIMIT row and the CITY LOD slider, which
     // is the cross-setting confusion this option was renamed to avoid. The
     // midnightclub fork calls both unconditionally for the same reason.
-    EnforceFrameLimit();
+    // With pace_at_swap the limiter waits at the swap instead (Patch_60FPS_Byte).
+    // sub_821BDA90 has callers on more than one thread: the limiter is bound to
+    // the first, the game loop.
+    static const std::thread::id owner = std::this_thread::get_id();
+    if (!REXCVAR_GET(pace_at_swap) && std::this_thread::get_id() == owner) {
+        EnforceFrameLimit();
+    }
+    g_timer_since_swap.store(true, std::memory_order_relaxed);  // see HoldUntimedSwap
     UpdateCityLODMemory();
     RecordFrameTime();
     TickGuestProfiler();
