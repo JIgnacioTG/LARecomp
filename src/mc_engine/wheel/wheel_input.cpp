@@ -1467,10 +1467,12 @@ void WheelThread() {
     Shared& sh = S();
     // This SDL instance has to stay away from every pad: the SDK's own driver owns those. Only
     // DirectInput devices are enumerated, and the HID drivers that would init a pad are off.
+#if defined(_WIN32)
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "0");
     SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, "0");
     SDL_SetHint(SDL_HINT_JOYSTICK_WGI, "0");
     SDL_SetHint(SDL_HINT_XINPUT_ENABLED, "0");
+#endif
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
 
     while (true) {

@@ -53,3 +53,20 @@ entry unchanged until the new version is actually tested.
 
 A successful build does not establish gameplay, audio, save compatibility,
 performance, quit handling or long-session stability. These remain untested.
+# Linux input follow-up
+
+The first runtime test exposed a shared-SDL conflict. Unlike the Windows DLL
+layout, the Linux executable resolves its SDL calls through `librexruntime.so`.
+The new menu pad layer initialized gamepads before the SDK installed its event
+watch and disabled gamepad events globally. This could hide initially connected
+controllers and suppress input from controllers connected later.
+
+Linux menu polling now waits for SDK gamepad initialization and does not disable
+events or controller backends. Windows keeps its separate-copy behavior. The
+wheel thread's Windows-only backend exclusions are also guarded by platform.
+Pre-runtime dialogs on Linux remain keyboard-operable; controller menu polling
+becomes available after SDK input initialization.
+
+For keyboard-as-controller testing, enable `mnk_mode = true` in the isolated
+runtime configuration. Start is Return or X; A is the SDK's configured binding.
+This setting is local to the trial build and is not a stable-install change.

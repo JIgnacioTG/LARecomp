@@ -69,6 +69,13 @@ XInputGetStateFn LoadXInput() {
 }  // namespace
 
 void EnsurePadLayer() {
+#if !defined(_WIN32)
+  // ELF builds use the SDK's SDL instance, not a private DLL-local copy.
+  // Let its input driver initialize gamepads and install its event watch first.
+  // Early initialization loses the initial device-added events; disabling
+  // gamepad events here also disables gameplay input for the entire process.
+  g_layer_up = (SDL_WasInit(SDL_INIT_GAMEPAD) & SDL_INIT_GAMEPAD) != 0;
+#else
   static std::once_flag once;
   std::call_once(once, [] {
     // The wheel code's hints (wheel_input.cpp, WheelThread): this SDL must not
@@ -92,9 +99,11 @@ void EnsurePadLayer() {
       SDL_AddGamepadMappingsFromFile(mappings.c_str());
     }
   });
+#endif
 }
 
 std::vector<PadInfo> ListPads() {
+  EnsurePadLayer();
   std::vector<PadInfo> pads;
   if (!g_layer_up) return pads;
   // Picks up devices that came or went since the last call.
@@ -139,6 +148,7 @@ void MenuGamepad::Release(ImGuiIO* io) {
 }
 
 void MenuGamepad::Feed(ImGuiIO& io) {
+  EnsurePadLayer();
   io_ = &io;
   bool down[std::size(kButtons)] = {};
   float stick[4] = {};  // up, down, left, right, 0..1 before the dead zone

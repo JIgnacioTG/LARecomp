@@ -11,7 +11,10 @@ struct SDL_Gamepad;
 
 namespace mcla::ui {
 
-// LARecomp's pad layer for its own dialogs. Two SDLs run in this process: the
+// On Linux, the SDK and application share SDL: the SDK owns initialization
+// and gameplay events. Menu polling becomes available after SDK input setup;
+// pre-runtime dialogs remain keyboard-operable.
+// On Windows, two SDLs run in this process: the
 // SDK's, inside rexruntime.dll, owns the pads in game; the exe's own static
 // copy is shared with the wheel code, which keeps it to DirectInput (HIDAPI,
 // RawInput, WGI and XInput off) so it never takes a pad from the SDK's. In
