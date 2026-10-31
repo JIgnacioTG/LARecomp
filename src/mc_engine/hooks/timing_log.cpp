@@ -105,6 +105,7 @@ static void AddGpuTimingDeltas(AddDelta&& add_delta) {
 }
 
 void SampleCounters() {
+#ifdef REXGLUE_ENABLE_PERF_COUNTERS
     using rex::perf::CounterId;
     using rex::perf::GetCounter;
 
@@ -148,6 +149,7 @@ void SampleCounters() {
     add_delta(g_ctr.cmdbuf_stalls,          CounterId::kCommandBufferStalls);
     add_delta(g_ctr.crit_contentions,       CounterId::kCriticalRegionContentions);
 
+#endif
     // Guest draw stats: recorded directly at D3DDevice draw entrypoints, ensuring accurate
     // counts even when SDK REXGLUE_ENABLE_PERF_COUNTERS is compiled out.
     g_ctr.draws += mcla::draw_stats::g_draw_calls.exchange(0, std::memory_order_relaxed);
@@ -280,6 +282,7 @@ void RecordFrameTime() {
         // shader/pipeline stall (pipeline create), streaming thrash (texupload,
         // cache misses), the guest CPU blocking on a GPU register wait
         // (waitregmem, cmdwait), and raw guest CPU churn (dispatched).
+#ifdef REXGLUE_ENABLE_PERF_COUNTERS
         {
             std::fprintf(log,
                 "           gpu us/s: submit=%llu draw=%llu fencewait=%llu resolve=%llu"
@@ -328,6 +331,11 @@ void RecordFrameTime() {
                 (long long)rex::perf::GetCounter(rex::perf::CounterId::kAudioFrameLatencyUs));
             g_ctr = {};
         }
+#else
+        std::fprintf(log, "           SDK counters unavailable (compiled out); "
+                          "guest draws=%llu vertices=%llu\n", CTR(draws), CTR(verts));
+        g_ctr = {};
+#endif
 
         // Do the engine's accumulated-time totals still advance? A NEGATIVE
         // delta means the engine reset them at a level or race transition, not

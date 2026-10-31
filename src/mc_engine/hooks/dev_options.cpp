@@ -7,6 +7,8 @@
 #include <rex/ppc.h>
 #include <rex/runtime.h>
 #include <rex/system/xmemory.h>
+#include <rex/memory/utils.h>
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -103,6 +105,17 @@ static bool EnsureDebugScratchWritable() {
             a = uint32_t(end);
         }
         return true;
+#elif defined(__linux__)
+        for (uint32_t a = lo; a < hi;) {
+            size_t length = 0;
+            rex::memory::PageAccess access = rex::memory::PageAccess::kNoAccess;
+            if (!rex::memory::QueryProtect(base + a, length, access)) return false;
+            if (access != rex::memory::PageAccess::kReadWrite &&
+                access != rex::memory::PageAccess::kExecuteReadWrite) return false;
+            if (length == 0) return false;
+            a += static_cast<uint32_t>(std::min<size_t>(length, hi - a));
+        }
+        return true;
 #else
         return false;
 #endif
@@ -129,6 +142,15 @@ static bool EnsureDebugScratchWritable() {
         state = State::kOk;
         LARECOMP_APP_INFO("[DbgOpt] scratch 0x{:08X}-0x{:08X} writable (host, was 0x{:X})",
                           lo, hi, uint32_t(old));
+        return true;
+    }
+#elif defined(__linux__)
+    // Guest code is recompiled into host code; these guest bytes only hold
+    // option strings. Match the Windows fallback without requesting execution.
+    if (rex::memory::Protect(base + lo, hi - lo, rex::memory::PageAccess::kReadWrite) &&
+        range_is_writable()) {
+        state = State::kOk;
+        LARECOMP_APP_INFO("[DbgOpt] scratch 0x{:08X}-0x{:08X} writable (host)", lo, hi);
         return true;
     }
 #endif

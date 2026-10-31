@@ -70,3 +70,32 @@ becomes available after SDK input initialization.
 For keyboard-as-controller testing, enable `mnk_mode = true` in the isolated
 runtime configuration. Start is Return or X; A is the SDK's configured binding.
 This setting is local to the trial build and is not a stable-install change.
+
+## Linux dev-option verification and FidelityFX
+
+The host-page verification in `EnsureDebugScratchWritable()` returned false on
+all non-Windows platforms, even when the guest heap had successfully made the
+scratch region writable. That disabled queued settings including
+`fastVehShadows`, despite `perf_fast_vehicle_shadows=true` in the configuration.
+
+Linux now verifies actual host mappings using SDK `QueryProtect`, walking the
+whole range. If guest heap protection is insufficient, it uses SDK `Protect`
+with read/write access only, then verifies again. Windows behavior is preserved.
+Guest code is recompiled; these guest pages hold data, not executed host code.
+
+The optimized rebuild passed. Diagnostic startup confirmed scratch writable
+through the guest heap and applied the `fastVehShadows` option at node+4
+`0x8288DD34` with value `1`. This proves option injection, not a measured FPS gain.
+The prior executable/config are backed up under ignored
+`out/integration/pre-dev-options/`; existing configuration and save hashes
+remained unchanged before the normal-logging test launch.
+
+The installed SDK was built with `REXGLUE_ENABLE_FIDELITYFX=OFF`. Its
+`present_effect`, FSR quality/sharpening cvars and Vulkan effect shaders are
+conditional on `REX_HAS_FIDELITYFX_SDK`, while LARecomp's Fidelity FX menu rows
+are not gated on that capability. Thus displaying those rows does not mean
+FSR is available. Enabling it needs a separate FidelityFX-enabled SDK build
+and staging its dependencies; no shared SDK or resolution settings were changed
+for the vehicle-shadow test. SDK temporal FSR paths also describe synthesized
+depth/motion inputs and possible spatial fallback, so FSR2/3 correctness must be
+validated separately rather than inferred from the menu label.

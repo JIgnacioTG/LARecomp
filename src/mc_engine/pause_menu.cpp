@@ -9,6 +9,7 @@
 #include "online/server_browser/browser_ui.h"
 #include "ui_forms.h"
 #include "ui_palette.h"
+#include "save_protect.h"
 #include "online/system_link.h"
 
 #include <atomic>
@@ -34,9 +35,14 @@
 #include <rex/runtime.h>
 #include <rex/ppc/function.h>
 #include <rex/system/function_dispatcher.h>
+#include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 #if defined(__linux__)
 #include <SDL3/SDL_events.h>
+#endif
+
+#if defined(LARECOMP_HAS_GPU)
+#include "gpu/gpu.h"
 #endif
 
 REXCVAR_DEFINE_BOOL(show_test_movie, false, "MCLA/Settings",
@@ -1216,9 +1222,11 @@ using mcla_menu::Color;
 using mcla_menu::Dbl;
 using mcla_menu::ItemDef;
 using mcla_menu::ItemKind;
+using mcla_menu::kActionDumpTextures;
 using mcla_menu::kActionPlayCutscene;
 using mcla_menu::kActionQuitNo;
 using mcla_menu::kActionQuitYes;
+using mcla_menu::kActionReloadTextures;
 using mcla_menu::NativeOnly;
 using mcla_menu::Str;
 using mcla_menu::Submenu;
@@ -1333,16 +1341,15 @@ const ItemDef kVideoItems[] = {
 #else
     Bool("PM_RxMsaa",        "disable_msaa",             "MSAA: ",  true, " (RESTART)"),
 #endif
+    Dbl ("PM_RxFpsCap",      "fps_limit",                "FPS LIMIT: ", kFpsCapVals, 5, "%.0f", "", "UNCAPPED"),
+    Bool("PM_RxPaceAtSwap",  "pace_at_swap",             "PACE AT PRESENTATION: "),
 };
 
 const ItemDef kRecompItems[] = {
     Bool("PM_RxRubber",      "disable_rubberbanding",    "AI RUBBERBAND: ",   true, " (RESTART)"),
     Bool("PM_RxRealDelta",   "real_frame_delta",         "REAL FRAME DELTA: "),
-    Dbl ("PM_RxFpsCap",      "fps_limit",                "FPS LIMIT: ", kFpsCapVals, 5, "%.0f", "", "UNCAPPED"),
-    Bool("PM_RxPaceAtSwap",  "pace_at_swap",             "PACE AT PRESENTATION: "),
     // Live, but the intro has played by the time this menu opens: the next start.
     Bool("PM_RxIntroSpeed",  "intro_original_speed",     "ORIGINAL INTRO SPEED: "),
-    Bool("PM_RxDof",         "disable_dof",              "DEPTH OF FIELD: ", true),
     // BadassBaboon's Recomp Adjustments: in-game pause menu options
     Bool("PM_RxSmoothChassis", "smooth_chassis_depth",   "SUSPENSION FIX: "),
 };
@@ -1369,6 +1376,7 @@ const ItemDef kPerfItems[] = {
     Bool("PM_RxNoImpostors", "perf_no_impostors",         "TREE IMPOSTORS: ", true, " (ON RELOAD)"),
     Bool("PM_RxNoTrees",     "perf_no_trees",             "FOLIAGE: ", true, " (ON RELOAD)"),
     Bool("PM_RxNoFsBlur",    "perf_no_fullscreen_blur",   "SCREEN BLUR: ", true, " (RESTART)"),
+    Bool("PM_RxDof",         "disable_dof",               "DEPTH OF FIELD: ", true),
     Bool("PM_RxSingleTile",  "single_tile",               "SINGLE TILE: "),
     // Patch_FenceSpinThrottle, live: the hook reads the cvar on every call, so
     // the next fence poll already sees a change made here. Worth a row rather
@@ -1577,9 +1585,11 @@ const ItemDef kGfxHubItems[] = {
     Submenu("PM_RxSubNative", "RENDERER",    "RxNativeMenu"),
     XeniaOnly(Submenu("PM_RxSubFfx", "FIDELITY FX", "RxFfxMenu")),
     Submenu("PM_RxSubPerf",   "PERFORMANCE", "RxPerfMenu"),
+#if defined(LARECOMP_HAS_GPU)
+    NativeOnly(Submenu("PM_RxSubTex", "TEXTURE MODS", "RxTexMenu")),
+#endif
 };
 const ItemDef kGameHubItems[] = {
-    Submenu("PM_RxSubRecomp", "RECOMP SETTINGS", "RxRecompMenu"),
     Submenu("PM_RxSubCam",    "CAMERA",          "RxCamMenu"),
     Submenu("PM_RxSubTod",    "TIME OF DAY",     "RxTodMenu"),
     Submenu("PM_RxSubCarbon", "CARBON FIBER",    "RxCarbonMenu"),
@@ -1594,6 +1604,14 @@ const ItemDef kExtrasHubItems[] = {
     Bool("PM_RxBigSession",  "net_lift_big_session_limits", "NO 8 PLAYER LIMITS: ", false,
          " (NEXT HOST)"),
 };
+#if defined(LARECOMP_HAS_GPU)
+// Texture mods on the Plume renderer: the frame's textures to
+// <mods>/textures_dump/, and the textures_replace/ folders read again.
+const ItemDef kTexItems[] = {
+    Action("PM_RxTexDump",   kActionDumpTextures),
+    Action("PM_RxTexReload", kActionReloadTextures),
+};
+#endif
 // NO first: the cursor starts on the first row, so a stray A keeps the game.
 const ItemDef kQuitItems[] = {
     Action("PM_RxQuitNo",  kActionQuitNo),
@@ -1679,11 +1697,15 @@ const ItemDef& MenuItemAt(const MenuDef& md, int i) {
 }
 
 const MenuDef kMenus[] = {
-    // Hubs: the buttons of the SETTINGS tab.
+    // The buttons of the SETTINGS tab: the recomp's own fixes first, then the
+    // hubs.
+    {"PM_RxTabRecomp", "RECOMP SETTINGS", "Fixes and options added by the recomp.",
+     "RxRecompMenu",
+     kRecompItems, int(sizeof(kRecompItems) / sizeof(kRecompItems[0]))},
     {"PM_RxTabGfx", "GRAPHICS", "Display, renderer and performance.",
      "RxGfxMenu",
      kGfxHubItems, int(sizeof(kGfxHubItems) / sizeof(kGfxHubItems[0]))},
-    {"PM_RxTabGame", "GAMEPLAY", "Recomp fixes, camera, time and cars.",
+    {"PM_RxTabGame", "GAMEPLAY", "Camera, time of day and cars.",
      "RxGameMenu",
      kGameHubItems, int(sizeof(kGameHubItems) / sizeof(kGameHubItems[0]))},
     {"PM_RxTabIface", "INTERFACE", "Menu colors and language.",
@@ -1693,15 +1715,17 @@ const MenuDef kMenus[] = {
      "RxExtrasMenu",
      kExtrasHubItems, int(sizeof(kExtrasHubItems) / sizeof(kExtrasHubItems[0]))},
     // Reached through a hub.
-    {"PM_RxTabVideo", "DISPLAY", "Window, resolution and vsync.",
+    {"PM_RxTabVideo", "DISPLAY", "Window, resolution, vsync and FPS limit.",
      "RxVideoMenu",
      kVideoItems, int(sizeof(kVideoItems) / sizeof(kVideoItems[0]))},
-    {"PM_RxTabRecomp", "RECOMP SETTINGS", "Fixes and options added by the recomp.",
-     "RxRecompMenu",
-     kRecompItems, int(sizeof(kRecompItems) / sizeof(kRecompItems[0]))},
     {"PM_RxTabPerf", "PERFORMANCE", "Trade image quality for framerate.",
      "RxPerfMenu",
      kPerfItems, int(sizeof(kPerfItems) / sizeof(kPerfItems[0]))},
+#if defined(LARECOMP_HAS_GPU)
+    {"PM_RxTabTex", "TEXTURE MODS", "Dump the game's textures, reload mods.",
+     "RxTexMenu",
+     kTexItems, int(sizeof(kTexItems) / sizeof(kTexItems[0]))},
+#endif
     {"PM_RxTabFfx", "FIDELITY FX", "Upscaling and sharpening of the image.",
      "RxFfxMenu",
      kFfxItems, int(sizeof(kFfxItems) / sizeof(kFfxItems[0]))},
@@ -1942,6 +1966,8 @@ std::string ItemRowLabel(const ItemDef& it) {
             return CutsceneReplayBusy() ? "PLAYING..." : "PLAY CUTSCENE";
         case kActionQuitYes: return "YES";
         case kActionQuitNo:  return "NO";
+        case kActionDumpTextures:   return "DUMP SCENE TEXTURES";
+        case kActionReloadTextures: return "RELOAD TEXTURE MODS";
         }
         return "";
     }
@@ -1994,19 +2020,27 @@ void ApplyItem(const ItemDef& it, int dir) {
             // Same as leaving a menu: settings that moved are written first.
             if (!g_settings_saved.exchange(true, std::memory_order_relaxed)) SaveSettingsNow();
             auto* runtime = rex::Runtime::instance();
-            auto* app_context = runtime ? runtime->app_context() : nullptr;
-            if (app_context) {
+            rex::ui::Window* window = runtime ? runtime->display_window() : nullptr;
+            if (window) {
                 MC_INFO("[pause-menu] quit requested from the QUIT menu");
 #if defined(__linux__)
-                // Use normal window closure to stop the title before exiting.
+                // SDL owns the Linux event loop; use normal closure after pending saves.
+                MclaWaitForSaves();
                 SDL_Event event{};
                 event.type = SDL_EVENT_QUIT;
                 if (!SDL_PushEvent(&event)) {
                     MC_WARN("[pause-menu] could not queue quit: {}", SDL_GetError());
                 }
 #else
-                app_context->RequestDeferredQuit();
+                window->app_context().CallInUIThread([window] {
+                    MclaWaitForSaves();
+                    window->RequestClose();
+                });
 #endif
+            } else if (auto* app_context = runtime ? runtime->app_context() : nullptr) {
+                MC_INFO("[pause-menu] quit requested, closing via deferred quit");
+                MclaWaitForSaves();
+                app_context->RequestDeferredQuit();
             } else {
                 MC_WARN("[pause-menu] quit requested, but app context is unavailable");
             }
@@ -2015,6 +2049,17 @@ void ApplyItem(const ItemDef& it, int dir) {
         case kActionQuitNo:
             // Closes the QUIT form the way B does; the select sound is the A's.
             larecomp::ui::CloseForm(larecomp::ui::TopForm());
+            break;
+        case kActionDumpTextures:
+            // Every texture held, not the next frame's: that one is this menu.
+#if defined(LARECOMP_HAS_GPU)
+            mcla::gpu::RequestTextureDumpAll();
+#endif
+            break;
+        case kActionReloadTextures:
+#if defined(LARECOMP_HAS_GPU)
+            mcla::gpu::RequestTextureReload();
+#endif
             break;
         }
         break;

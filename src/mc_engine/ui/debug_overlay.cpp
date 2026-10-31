@@ -62,6 +62,10 @@ void MclaDebugOverlayDialog::OnDraw(ImGuiIO& io) {
                  ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
                      ImGuiWindowFlags_NoFocusOnAppearing,
                  prompts)) {
+    const int refresh = static_cast<int>(REXCVAR_GET(video_mode_refresh_rate));
+    const int target_hz = refresh > 0 ? refresh : 60;
+    char line[64];
+#ifdef REXGLUE_ENABLE_PERF_COUNTERS
     const int64_t ft_us = rex::perf::GetSnapshotCounter(rex::perf::CounterId::kFrameTimeUs);
     const float ft_ms = static_cast<float>(ft_us) / 1000.0f;
     const int64_t fps = rex::perf::GetSnapshotCounter(rex::perf::CounterId::kFps);
@@ -72,12 +76,10 @@ void MclaDebugOverlayDialog::OnDraw(ImGuiIO& io) {
     const long long display_fps =
         fps > 0 ? static_cast<long long>(fps)
                 : static_cast<long long>(1000.0f / std::max(0.1f, ft_ms));
-    const int refresh = static_cast<int>(REXCVAR_GET(video_mode_refresh_rate));
-    const int target_hz = refresh > 0 ? refresh : 60;
+
 
     // The headline reads like the GPS card's "ROOKIE - 3640 REP" line, with
     // the meter under it filling toward the target rate.
-    char line[64];
     std::snprintf(line, sizeof(line), "%lld FPS - %.2f MS", display_fps, ft_ms);
     ImGui::TextUnformatted(line);
     SegmentMeter(static_cast<float>(display_fps) / static_cast<float>(target_hz), kContentWidth);
@@ -92,6 +94,11 @@ void MclaDebugOverlayDialog::OnDraw(ImGuiIO& io) {
     ImGui::PopStyleVar();
     ImGui::PopStyleColor();
     ImGui::Dummy(ImVec2(0.0f, 2.0f));
+
+#else
+    ImGui::TextDisabled("SDK frame counters disabled in this build.");
+    ImGui::Dummy(ImVec2(0.0f, 2.0f));
+#endif
 
     StatRow("RENDERER", rex::cvar::GetFlagByName("mcla_native_gfx") == "true" ? "NATIVE GFX" : "REXGLUE GFX");
 

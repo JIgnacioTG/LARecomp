@@ -1,0 +1,24 @@
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -1986,9 +1986,18 @@
+         }
+         [[maybe_unused]] bool temporal_effect_selected = false;
+ #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+-        temporal_effect_selected =
+-            guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
+-            guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3;
++        // The generic presenter has only the colour image, not the game's
++        // depth, motion vectors or jitter/history inputs. Do not dispatch the
++        // temporal provider with colour aliased as depth/motion. Keep the
++        // existing spatial EASU/RCAS fallback until real inputs are integrated.
++        if (guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
++            guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3) {
++          static std::atomic<bool> temporal_inputs_missing_logged = false;
++          if (!temporal_inputs_missing_logged.exchange(true)) {
++            REXLOG_WARN("VulkanPresenter: FSR2/FSR3 real depth/motion inputs unavailable; "
++                        "using spatial FSR (no temporal reconstruction or frame generation)");
++          }
++        }
+ #endif
+         for (size_t i = 0; i < guest_output_flow.effect_count; ++i) {
+           bool is_final_effect = i + 1 >= guest_output_flow.effect_count;

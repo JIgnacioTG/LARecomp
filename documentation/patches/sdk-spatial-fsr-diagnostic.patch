@@ -1,0 +1,24 @@
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -2200,6 +2200,21 @@
+           }
+ 
+           dfn.vkCmdDraw(draw_command_buffer, 4, 1, 0, 0);
++#if defined(REX_HAS_FIDELITYFX_SDK)
++          // One diagnostic per spatial pass, not per frame. Confirms an
++          // actual draw path rather than merely a menu/config selection.
++          static thread_local uint32_t logged_spatial_passes = 0;
++          if (effect == GuestOutputPaintEffect::kFsrEasu ||
++              effect == GuestOutputPaintEffect::kFsrRcas) {
++            const uint32_t pass_bit = 1u << uint32_t(effect);
++            if (!(logged_spatial_passes & pass_bit)) {
++              logged_spatial_passes |= pass_bit;
++              REXLOG_INFO("VulkanPresenter: spatial FSR {} draw recorded (output {}x{})",
++                          effect == GuestOutputPaintEffect::kFsrEasu ? "EASU" : "RCAS",
++                          effect_rect_size.first, effect_rect_size.second);
++            }
++          }
++#endif
+ 
+           if (is_final_effect) {
+             // Clear the letterbox around the guest output if the guest output

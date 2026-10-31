@@ -1,0 +1,22 @@
+diff --git a/sdk/include/FidelityFX/gpu/CMakeCompileShaders.txt b/sdk/include/FidelityFX/gpu/CMakeCompileShaders.txt
+index 4f42205..59c6539 100644
+--- a/sdk/include/FidelityFX/gpu/CMakeCompileShaders.txt
++++ b/sdk/include/FidelityFX/gpu/CMakeCompileShaders.txt
+@@ -85,7 +85,16 @@ function(compile_shaders_with_depfile
+ 		set(WAVE64_16BIT_PERMUTATION_HEADER ${OUTPUT_PATH}/${PASS_SHADER_TARGET}_wave64_16bit_permutations.h)
+ 
+ 		# combine base and permutation args
+-		set(SC_ARGS ${BASE_ARGS} ${API_BASE_ARGS} ${PERMUTATION_ARGS})
++		set(SC_ARGS ${BASE_ARGS} ${API_BASE_ARGS})
++        # Bash (also /bin/sh on Arch) expands unquoted {0,1} into two -D
++        # arguments. These are a single permutation descriptor for FFX_SC.
++        foreach(PERMUTATION_ARG IN LISTS PERMUTATION_ARGS)
++            if(UNIX)
++                list(APPEND SC_ARGS "'${PERMUTATION_ARG}'")
++            else()
++                list(APPEND SC_ARGS "${PERMUTATION_ARG}")
++            endif()
++        endforeach()
+ 
+ 		# Wave32
+ 		add_custom_command(
