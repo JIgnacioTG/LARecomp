@@ -81,3 +81,13 @@ launch is implied by a successful build; gameplay and saving need a later test.
 - Launcher quotes known bare graphics_backend enum tokens before loading
   config, preserving a backup of any repaired file. Default build directory
   matches the retained build. Does not alter the shared SDK or other settings.
+
+## Performance-menu row regression
+
+Upstream 9ac940a moved DEPTH OF FIELD into PERFORMANCE, increasing that table
+from 17 to 18 items. BuildNativeRows rejected it against the old 17-row host
+array capacity; runtime logs explicitly reported the rejection. Derive the
+capacity from the Performance table while retaining the prior minimum. The
+guest form itself allocates the requested row count. Targeted rebuild compiled
+the menu object and linked successfully; in-game navigation remains to be
+verified after the next launch. No graphics settings were changed by this fix.

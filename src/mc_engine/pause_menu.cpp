@@ -2080,7 +2080,11 @@ void ClickItem(const ItemDef& it) { ApplyItem(it, +1); }
 // the other route entirely and stops using states as rows: real row objects
 // of the game's own value class, handed to the list through its widget array.
 
-constexpr int kMaxRowsPerMenu = 17;  // DEBUG CAMERA is 6 + 3 (rear view) + 8 (free look)
+// The older camera menu required 17 rows. PERFORMANCE gained a row when
+// DEPTH OF FIELD moved here; size host-side storage for its actual table.
+// This is not a guest/Flash row limit: CreateListForm allocates the requested count.
+constexpr int kMaxRowsPerMenu =
+    std::max(17, int(sizeof(kPerfItems) / sizeof(kPerfItems[0])));
 
 struct NativeRows {
     uint32_t row[kMaxRowsPerMenu] = {};     // guest row objects
